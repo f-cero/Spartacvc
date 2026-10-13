@@ -11,12 +11,16 @@ RVC inference needs three ONNX graphs. Torch `.pth` is the community format, so
 we either find pre-exported ONNX or do a **one-off** `.pth → ONNX` export
 (throwaway Python env — never a runtime dependency).
 
-- [ ] **HuBERT base** (768-dim speaker features) → `hubert_base.onnx`
-- [ ] **RMVPE** f0 extractor → `rmvpe.onnx` (official ONNX from RVC-WebUI)
-- [ ] **One RVC v2 voice model** (e.g. a Genshin JP voice) → `voice.onnx` +
-      optional `voice.index`
-- [ ] Verify the ONNX pipeline reproduces a known-good reference output
-      (compare against a Python RVC render of the same input)
+- [x] **HuBERT base** (768-dim features) → `models/ozada/vec-768-layer-12.onnx`
+- [x] **RMVPE** f0 extractor → `models/ozada/rmvpe.onnx`
+- [x] **One RVC v2 voice model** → `models/ozada/travisscottv2.onnx`
+- [x] **Working Python reference** → `tools/reference_pipeline.py` (validated E2E)
+- [ ] Port reference to C (ONNX Runtime C API) + confirm DirectML session runs
+
+**Pipeline (validated):** resample→16k → HuBERT (50fps) → **resample 80fps** →
+RMVPE mel(128,n_fft1024,hop160,fmin30,fmax8k)→cents-decode→f0 → resample 80fps →
+World decoder `phone[1,T,768]`+`pitch`+`pitchf`+`ds`+`rnd[1,192,T]` → audio @32k.
+Voice model native rate = **80fps** (400 samples/frame @32k); output length = input.
 
 **Done when:** a reference C program loads all three ONNX files and converts a
 test WAV with audible, correct output.
