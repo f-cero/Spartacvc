@@ -5,13 +5,13 @@ executable. No Python. No runtime dependencies. One exe, one models folder.
 
 RVC swaps the *timbre* of speech (who is speaking) while preserving *prosody*
 (how it is spoken) — which is why it pairs perfectly with a TTS engine like
-Kokoro: the TTS brings the emotion and pacing, Spartacvc brings the voice.
+Kokoro: the TTS brings the emotion and pacing, Spartacvς brings the voice.
 
 ## Why C?
 
 Every existing RVC runtime is a Python stack (torch + fairseq + faiss), which on
 Windows means source-building abandoned libraries or running Docker. The models
-themselves are just neural nets — they run fine as ONNX graphs. `Spartacvc` executes
+themselves are just neural nets — they run fine as ONNX graphs. Spartacvς executes
 them with the ONNX Runtime C API and nothing else:
 
 | Concern        | Answer                                                        |
@@ -73,10 +73,10 @@ $spartacvc/
 
 ## Getting models
 
-Spartacvc does **not** ship voice models (they are third-party works with their own
+Spartacvς does **not** ship voice models (they are third-party works with their own
 licenses). Point the config at a models folder; see
 [`tools/download_models.md`](tools/download_models.md) for verified sources and
-how to convert a `.pth` RVC model to the ONNX layout Spartacvc expects.
+how to convert a `.pth` RVC model to the ONNX layout Spartacvς expects.
 
 ## Status
 

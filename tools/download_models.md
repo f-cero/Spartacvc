@@ -1,6 +1,6 @@
 # Getting RVC models
 
-Spartacvc does **not** ship voice models. They are third-party works — check each
+Spartacvς does **not** ship voice models. They are third-party works — check each
 model's own license before redistributing.
 
 ## Verified sources (as of project start)
@@ -13,23 +13,24 @@ model's own license before redistributing.
 > Always confirm a repo is active and its files intact before depending on it.
 > HF repos can be renamed or removed.
 
-## Model layout Spartacvc expects
+## Model layout Spartacvς expects
+
+Each voice model has a **feature dimension** (256 or 768) that dictates which
+HuBERT base to pair with. The voice graph declares it in its `phone` input shape.
 
 ```
 models/
-├── hubert_base.onnx        # HuBERT base feature extractor (shared)
-├── rmvpe.onnx              # f0 extractor (shared)
-└── <voice-name>/
-    ├── voice.onnx          # RVC v1/v2 converter graph
-    ├── voice.index         # (optional) retrieval index
-    └── model.json          # (optional) per-model defaults
+├── vec-256-layer-9.onnx    # HuBERT base → 256-dim features (pair with 256-dim voices)
+├── vec-768-layer-12.onnx   # HuBERT base → 768-dim features (pair with 768-dim voices)
+├── rmvpe.onnx              # f0 extractor (shared across all voices)
+└── <voice-name>.onnx       # RVC v1/v2 converter graph (e.g. beyonce.onnx, ganyu.onnx)
 ```
 
 ## `.pth` → `.onnx` (one-off conversion)
 
-Spartacvc runs ONNX, but the community distributes torch `.pth`. Converting is a
+Spartacvς runs ONNX, but the community distributes torch `.pth`. Converting is a
 **one-time** step in a throwaway Python environment — it is *not* a runtime
-dependency of Spartacvc.
+dependency of Spartacvς.
 
 Procedure (to be finalized in Phase 0):
 1. Load the `.pth` with the RVC `VC` module class.

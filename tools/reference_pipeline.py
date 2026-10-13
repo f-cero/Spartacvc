@@ -1,28 +1,35 @@
-import numpy as np, soundfile as sf, onnxruntime as ort
+import numpy as np, soundfile as sf, onnxruntime as ort, sys
 from scipy.signal import resample
 M = "X:/pi-code/spartacvc/models/ozada"
 CPU = ["CPUExecutionProvider"]
-hub = ort.InferenceSession(f"{M}/vec-768-layer-12.onnx", providers=CPU)
-rmvpe = ort.InferenceSession(f"{M}/rmvpe.onnx", providers=CPU)
-voice = ort.InferenceSession(f"{M}/travisscottv2.onnx", providers=CPU)
+voice_path = sys.argv[1] if len(sys.argv)>1 else f"{M}/beyonce.onnx"
+hubert_path = sys.argv[2] if len(sys.argv)>2 else f"{M}/vec-256-layer-9.onnx"
+rmvpe_path = f"{M}/rmvpe.onnx"
+inp = sys.argv[3] if len(sys.argv)>3 else "C:/temp/test_speech.wav"
+outp = sys.argv[4] if len(sys.argv)>4 else "C:/temp/spartacvc_fem.wav"
 
-wav, sr = sf.read("C:/temp/test_speech.wav"); wav = wav.astype(np.float32)
+hub = ort.InferenceSession(hubert_path, providers=CPU)
+rmvpe = ort.InferenceSession(rmvpe_path, providers=CPU)
+voice = ort.InferenceSession(voice_path, providers=CPU)
+print(f"voice={voice_path.split('/')[-1]}  hubert={hubert_path.split('/')[-1]}")
+
+wav, sr = sf.read(inp); wav = wav.astype(np.float32)
 wav16 = resample(wav, int(len(wav)*16000/sr)).astype(np.float32)
 dur = len(wav16)/16000
-TARGET_FPS = 80.0   # voice model native rate (400 samples/frame @ 32k)
+TARGET_FPS = 80.0
 T = int(round(dur * TARGET_FPS))
 
-# HuBERT (50fps) -> resample to 80fps
-embed = hub.run(None, {hub.get_inputs()[0].name: wav16.reshape(1,1,-1)})[0]  # [1,T50,768]
+# HuBERT -> resample to 80fps
+embed = hub.run(None, {hub.get_inputs()[0].name: wav16.reshape(1,1,-1)})[0]  # [1,T50,FEDIM]
 T50 = embed.shape[1]
-e = embed[0]  # [T50, 768]
+e = embed[0]
 if T != T50:
     idx = np.linspace(0, T50-1, T)
     lo = np.floor(idx).astype(int); hi = np.minimum(lo+1, T50-1); fr = (idx-lo)[:,None]
     e = e[lo]*(1-fr) + e[hi]*fr
-phone = e.astype(np.float32)[None]  # [1,T,768]
+phone = e.astype(np.float32)[None]
 
-# mel + RMVPE (100fps) -> f0 -> resample to 80fps
+# mel + RMVPE -> f0 -> 80fps
 def hz2mel(h): return 2595*np.log10(1+h/700)
 def mel2hz(m): return 700*(10**(m/2595)-1)
 n_fft, hop, n_mels, fmin, fmax = 1024, 160, 128, 30, 8000
@@ -48,10 +55,8 @@ ts=np.stack([sp[i,st[i]:en[i]] for i in range(len(center))],0)
 tc=np.stack([cm[st[i]:en[i]] for i in range(len(center))],0)
 cents=(ts*tc).sum(1)/ts.sum(1); cents[sal.max(1)<=0.05]=0
 f0=10*(2**(cents/1200)); f0[f0==10]=0
-# resample f0 to T
 f0 = np.interp(np.linspace(0,1,T), np.linspace(0,1,len(f0)), f0)
 
-# voice model
 pf = f0.astype(np.float32).reshape(1,-1)
 f0min,f0max=50,1100; fmm=1127*np.log(1+f0min/700); fmx=1127*np.log(1+f0max/700)
 fm=1127*np.log(1+pf/700); fm[fm>0]=(fm[fm>0]-fmm)*254/(fmx-fmm)+1
@@ -60,10 +65,11 @@ pitch=np.rint(fm).astype(np.int64)
 out=voice.run(None,{voice.get_inputs()[0].name:phone,voice.get_inputs()[1].name:np.array([T],np.int64),
   voice.get_inputs()[2].name:pitch,voice.get_inputs()[3].name:pf,voice.get_inputs()[4].name:np.array([0],np.int64),
   voice.get_inputs()[5].name:np.random.randn(1,192,T).astype(np.float32)})[0]
-a=out.reshape(-1)
-outdur=len(a)/32000
-print(f"IN  {dur:.2f}s  OUT {outdur:.2f}s  ratio={outdur/dur:.3f}")
-print(f"peak={float(abs(a).max()):.4f}  rms={float(np.sqrt(np.mean(a**2))):.5f}  voiced_in={float((f0>0).mean()):.2f}")
-# save both float and int16
-sf.write("C:/temp/spartacvc_out.wav", (a*32767).astype(np.int16), 32000)
-print("WROTE C:/temp/spartacvc_out.wav")
+a=out.reshape(-1); outdur=len(a)/32000
+print(f"IN {dur:.2f}s OUT {outdur:.2f}s ratio={outdur/dur:.3f} peak={float(abs(a).max()):.3f} rms={float(np.sqrt(np.mean(a**2))):.4f}")
+def flat(x):
+    s=np.abs(np.fft.rfft(x*np.hanning(len(x))))+1e-9
+    return np.exp(np.mean(np.log(s)))/np.mean(s)
+print("flatness:", round(flat(a),4), "(speech~0.02-0.1)")
+sf.write(outp,(a*32767).astype(np.int16),32000)
+print("WROTE", outp)

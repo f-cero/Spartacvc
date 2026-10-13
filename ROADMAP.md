@@ -1,4 +1,4 @@
-# Spartacvc Roadmap
+# Spartacvς Roadmap
 
 Phases are ordered by dependency. Each phase ends with something runnable and
 verifiable — no phase ships "invisible" work.
@@ -80,10 +80,10 @@ The converted voice must appear as an *input* device to other apps.
       (VB-Cable / VoiceMeeter / Steam Audio) as the output device; the cable's
       "Input" side is the mic other apps see. Zero driver code.
 - [ ] **Option B (stretch):** bundle a small open-source WASAPI virtual audio
-      driver so `Spartacvc` *is* the "RVC-output" device, no third-party cable.
+      driver so `Spartacvς` *is* the "RVC-output" device, no third-party cable.
       (Larger effort — kernel driver + installer; only after A works.)
 
-**Done when:** set Spartacvc output to the virtual cable → select the cable input
+**Done when:** set Spartacvς output to the virtual cable → select the cable input
 in Discord/a game → the *converted* voice is what they hear.
 
 ---
