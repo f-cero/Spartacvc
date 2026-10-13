@@ -1,0 +1,24 @@
+# build
+build/
+out/
+*.obj
+*.o
+*.exe
+*.dll
+!third_party/
+# models (third-party, never commit)
+models/
+*.onnx
+*.pth
+*.index
+*.gguf
+# secrets / local config
+config.json
+*.token
+.env
+# OS / editor
+Thumbs.db
+Desktop.ini
+.vs/
+.vscode/
+__pycache__/
