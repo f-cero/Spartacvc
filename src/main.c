@@ -6,13 +6,17 @@
  *   1. Read WAV (16-bit PCM mono)
  *   2. Resample to 16 kHz
  *   3. HuBERT ONNX -> embeddings [1, T, 256|768]
- *   4. Resample embeddings to target fps (80 Hz)
+ *   4. Resample embeddings to model fps (per-model, NOT hardcoded)
  *   5. Mel spectrogram (16 kHz, 1024 FFT, 160 hop, 128 mels)
  *   6. RMVPE ONNX -> f0 [Hz] per frame
  *   7. Pitch shift (semitones)
- *   8. Quantize f0 to RVC 1..255 scale
- *   9. Voice decoder ONNX -> PCM 32 kHz
- *   10. Write WAV
+ *   8. Resample f0 to model fps
+ *   9. Quantize f0 to RVC 1..255 scale
+ *  10. Voice decoder ONNX -> PCM @ model_sr
+ *  11. Write WAV @ model_sr
+ *
+ * Per-model parameters (sr, fps) are derived from the voice model,
+ * never hardcoded.  256-dim models → 32kHz/80fps, 768-dim → 48kHz/100fps.
  *
  * Usage:
  *   spartacvc.exe input.wav --voice model.onnx --hubert hubert.onnx
@@ -24,6 +28,7 @@
 #include <string.h>
 #include <math.h>
 #include "onnx.h"
+#include "onnx_init.h"
 #include "mel.h"
 #include "f0.h"
 #include "debug.h"
@@ -38,6 +43,13 @@ typedef struct {
     int sr;
 } spcv_wav;
 
+/**
+ * @brief  Read a WAV file (16-bit or 32-bit float PCM, mono or stereo).
+ *
+ * @param  path  file path
+ * @param  w     [out] WAV data (caller frees w->data)
+ * @return  0 on success, -1 on failure
+ */
 int spcv_wav_read(const char *path, spcv_wav *w) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -91,6 +103,15 @@ int spcv_wav_read(const char *path, spcv_wav *w) {
     return 0;
 }
 
+/**
+ * @brief  Write 16-bit PCM mono WAV.
+ *
+ * @param  path  output file path
+ * @param  data  float samples in [-1, 1]
+ * @param  n     number of samples
+ * @param  sr    sample rate
+ * @return  0 on success, -1 on failure
+ */
 int spcv_wav_write(const char *path, const float *data, int64_t n, int sr) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
@@ -116,12 +137,14 @@ int spcv_wav_write(const char *path, const float *data, int64_t n, int sr) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Linear resample                                                    */
+/*  Resampling helpers                                                 */
 /* ------------------------------------------------------------------ */
 
-static float *resample(const float *in, int64_t n_in, int sr_in, int sr_out) {
-    if (sr_in == sr_out) return (float *)in;
-    int64_t n_out = (int64_t)((double)n_in * sr_out / sr_in);
+/**
+ * @brief  Linear-interpolation resample of a 1-D signal.
+ */
+static float *resample_1d(const float *in, int64_t n_in, int64_t n_out) {
+    if (n_in == n_out) return (float *)in;
     float *out = malloc(n_out * sizeof(float));
     if (!out) return NULL;
     double ratio = (double)n_in / n_out;
@@ -136,10 +159,9 @@ static float *resample(const float *in, int64_t n_in, int sr_in, int sr_out) {
     return out;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Embedding resample (time axis)                                     */
-/* ------------------------------------------------------------------ */
-
+/**
+ * @brief  Linear-interpolation resample of embeddings along time axis.
+ */
 static float *resample_embed(const float *emb, int64_t t_in, int64_t t_out, int dim) {
     if (t_in == t_out) return (float *)emb;
     float *out = malloc(t_out * dim * sizeof(float));
@@ -200,40 +222,55 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* 2. Load models */
-    spcv_onnx_session *hub = NULL, *voice = NULL, *rmvpe = NULL;
-    SPCV_TRACE("main", "loading HuBERT: %s", hubert_path);
-    if (spcv_onnx_load(hubert_path, &hub) != SPCV_ONNX_OK) {
-        fprintf(stderr, "FATAL: HuBERT load\n"); return 1;
-    }
+    /* 2. Load voice model first — its config determines fps and sr */
+    spcv_onnx_session *voice = NULL;
     SPCV_TRACE("main", "loading voice: %s", voice_path);
     if (spcv_onnx_load(voice_path, &voice) != SPCV_ONNX_OK) {
         fprintf(stderr, "FATAL: voice load\n"); return 1;
+    }
+
+    /* 3. Derive per-model parameters from the voice model */
+    int model_sr = 0, model_fps = 0, model_dim = 0;
+    if (spcv_voice_model_config(voice, &model_sr, &model_fps, &model_dim) != 0) {
+        fprintf(stderr, "FATAL: cannot determine voice model config\n");
+        spcv_onnx_free(voice);
+        return 1;
+    }
+    SPCV_TRACE("main", "model: sr=%d fps=%d dim=%d", model_sr, model_fps, model_dim);
+
+    /* 4. Load HuBERT + RMVPE */
+    spcv_onnx_session *hub = NULL, *rmvpe = NULL;
+    SPCV_TRACE("main", "loading HuBERT: %s", hubert_path);
+    if (spcv_onnx_load(hubert_path, &hub) != SPCV_ONNX_OK) {
+        fprintf(stderr, "FATAL: HuBERT load\n"); return 1;
     }
     SPCV_TRACE("main", "loading RMVPE: %s", rmvpe_path);
     if (spcv_onnx_load(rmvpe_path, &rmvpe) != SPCV_ONNX_OK) {
         fprintf(stderr, "FATAL: RMVPE load\n"); return 1;
     }
 
-    /* 3. Read WAV */
+    /* 5. Read WAV */
     spcv_wav w;
     if (spcv_wav_read(input, &w) != 0) {
         fprintf(stderr, "FATAL: WAV read: %s\n", input); return 1;
     }
     SPCV_TRACE("main", "input: %lld samples @ %d Hz", (long long)w.n, w.sr);
 
-    /* 4. Resample to 16 kHz */
-    float *audio16 = resample(w.data, w.n, w.sr, 16000);
+    /* 6. Resample to 16 kHz (HuBERT input rate) */
+    float *audio16 = resample_1d(w.data, w.n,
+                                  (int64_t)((double)w.n * 16000.0 / w.sr));
     int64_t n16 = (int64_t)((double)w.n * 16000.0 / w.sr);
-    SPCV_TRACE("main", "resampled: %lld samples @ 16 kHz (%.2fs)", (long long)n16, (double)n16 / 16000.0);
+    SPCV_TRACE("main", "resampled: %lld samples @ 16 kHz (%.2fs)",
+               (long long)n16, (double)n16 / 16000.0);
 
-    /* 5. HuBERT inference */
+    /* 7. HuBERT inference */
     SPCV_TRACE("main", "HuBERT inference...");
     spcv_onnx_input hin = {
         .name = hub->inputs[0].name, .data = audio16,
         .ndim = 3, .dims = {1, 1, n16}, .elem_type = 1
     };
-    spcv_onnx_output hout = { .name = hub->outputs[0].name, .buf = NULL, .buf_size = 0, .ort_value = NULL };
+    spcv_onnx_output hout = { .name = hub->outputs[0].name,
+                              .buf = NULL, .buf_size = 0, .ort_value = NULL };
     if (spcv_onnx_run(hub, &hin, 1, &hout, 1) != SPCV_ONNX_OK) {
         fprintf(stderr, "FATAL: HuBERT run\n"); return 1;
     }
@@ -241,17 +278,16 @@ int main(int argc, char **argv) {
     spcv_onnx_output_shape(&hout, &h_ndim, h_dims);
     const float *emb = (const float *)spcv_onnx_output_data(&hout);
     if (!emb) { fprintf(stderr, "FATAL: HuBERT no output\n"); return 1; }
-    int64_t t50 = h_dims[1];
+    int64_t t_hub = h_dims[1];
     int emb_dim = (int)h_dims[2];
-    SPCV_TRACE("main", "HuBERT: [%lld] %lld %lld %lld", (long long)h_ndim, (long long)h_dims[0], (long long)h_dims[1], (long long)h_dims[2]);
+    SPCV_TRACE("main", "HuBERT: T=%lld dim=%d", (long long)t_hub, emb_dim);
 
-    /* 6. Determine target fps from voice model input */
-    /* Voice input[0] is [1, dim, T] — T is dynamic, but we target 80 fps (32kHz/400) */
-    int target_fps = 80;
-    int64_t t80 = (int64_t)((double)n16 * target_fps / 16000.0);
-    SPCV_TRACE("main", "target: %lld frames @ %d fps (dim=%d)", (long long)t80, target_fps, emb_dim);
+    /* 8. Target frame count from model fps */
+    int64_t t_model = (int64_t)((double)n16 * model_fps / 16000.0);
+    SPCV_TRACE("main", "target: %lld frames @ %d fps (dim=%d)",
+               (long long)t_model, model_fps, emb_dim);
 
-    /* 7. Mel spectrogram (needs audio16 still alive) */
+    /* 9. Mel spectrogram (16 kHz audio) */
     SPCV_TRACE("main", "mel spectrogram...");
     int mel_frames = (int)spcv_mel_n_frames(n16);
     float *mel = malloc((size_t)mel_frames * 128 * sizeof(float));
@@ -261,13 +297,13 @@ int main(int argc, char **argv) {
     }
     SPCV_TRACE("main", "mel: %d frames x 128", mel_frames);
 
-    /* 8. Resample embeddings to target fps */
-    float *emb80 = resample_embed(emb, t50, t80, emb_dim);
+    /* 10. Resample HuBERT embeddings to model fps */
+    float *emb_model = resample_embed(emb, t_hub, t_model, emb_dim);
     spcv_onnx_free_output(&hout);
     free(audio16);
     free(w.data);
 
-    /* 9. f0 extraction (mel_frames frames at ~100 fps) */
+    /* 11. f0 extraction (RMVPE) */
     SPCV_TRACE("main", "f0 extraction...");
     float *f0 = malloc((size_t)mel_frames * sizeof(float));
     if (!f0) { fprintf(stderr, "FATAL: f0 alloc\n"); return 1; }
@@ -276,58 +312,44 @@ int main(int argc, char **argv) {
     }
     free(mel);
 
-    /* 10. Pitch shift */
+    /* 12. Pitch shift */
     spcv_f0_shift(f0, mel_frames, pitch_st);
 
-    /* 11. Resample f0 to t80 frames (80 fps) */
-    float *f0_80 = resample_embed(f0, mel_frames, t80, 1);
+    /* 13. Resample f0 to model fps */
+    float *f0_model = resample_1d(f0, mel_frames, t_model);
     free(f0);
 
-    /* 12. Quantize f0 to RVC 1..255 scale */
-    int64_t *pitch = malloc((size_t)t80 * sizeof(int64_t));
-    spcv_f0_quantize(f0_80, (int)t80, pitch);
-    /* f0_80 kept alive for pitchf below */
+    /* 14. Quantize f0 to RVC 1..255 scale */
+    int64_t *pitch = malloc((size_t)t_model * sizeof(int64_t));
+    spcv_f0_quantize(f0_model, (int)t_model, pitch);
 
-    /* 12. Voice decoder (6 inputs) */
+    /* 15. Voice decoder (6 inputs) */
     SPCV_TRACE("main", "voice decoder...");
-    int v_dim = emb_dim;
-    SPCV_TRACE("main", "voice: %d inputs, dim=%d, T=%lld", voice->n_inputs, v_dim, (long long)t80);
 
-    /* emb80 is already [T, dim] — model expects [1, T, dim] */
-    float *emb_cf = emb80; /* no transpose needed */
-    /* emb80 freed after voice run */
-
-    /* pitchf: f0 in Hz [1, T] float (from f0_80) */
-    float *pitchf = f0_80; /* reuse, don't free yet */
-
-    /* phone_lengths: [1] int64 */
-    int64_t phone_lengths = t80;
-
-    /* ds: [1] int64 = 0 */
+    int64_t phone_lengths = t_model;
     int64_t ds = 0;
-
-    /* rnd: [1, 192, T] float — random noise */
     int rnd_dim = 192;
-    float *rnd = malloc((size_t)rnd_dim * t80 * sizeof(float));
+    float *rnd = malloc((size_t)rnd_dim * t_model * sizeof(float));
     srand(42);
-    for (size_t i = 0; i < (size_t)rnd_dim * t80; i++)
+    for (size_t i = 0; i < (size_t)rnd_dim * t_model; i++)
         rnd[i] = (float)((rand() / (double)RAND_MAX) * 2.0 - 1.0);
 
     spcv_onnx_input vin[6] = {
-        { .name = voice->inputs[0].name, .data = emb_cf,
-          .ndim = 3, .dims = {1, t80, v_dim}, .elem_type = 1 },
+        { .name = voice->inputs[0].name, .data = emb_model,
+          .ndim = 3, .dims = {1, t_model, emb_dim}, .elem_type = 1 },
         { .name = voice->inputs[1].name, .data = &phone_lengths,
           .ndim = 1, .dims = {1}, .elem_type = 7 },
         { .name = voice->inputs[2].name, .data = pitch,
-          .ndim = 2, .dims = {1, t80}, .elem_type = 7 },
-        { .name = voice->inputs[3].name, .data = pitchf,
-          .ndim = 2, .dims = {1, t80}, .elem_type = 1 },
+          .ndim = 2, .dims = {1, t_model}, .elem_type = 7 },
+        { .name = voice->inputs[3].name, .data = f0_model,
+          .ndim = 2, .dims = {1, t_model}, .elem_type = 1 },
         { .name = voice->inputs[4].name, .data = &ds,
           .ndim = 1, .dims = {1}, .elem_type = 7 },
         { .name = voice->inputs[5].name, .data = rnd,
-          .ndim = 3, .dims = {1, rnd_dim, t80}, .elem_type = 1 }
+          .ndim = 3, .dims = {1, rnd_dim, t_model}, .elem_type = 1 }
     };
-    spcv_onnx_output vout = { .name = voice->outputs[0].name, .buf = NULL, .buf_size = 0, .ort_value = NULL };
+    spcv_onnx_output vout = { .name = voice->outputs[0].name,
+                              .buf = NULL, .buf_size = 0, .ort_value = NULL };
 
     if (spcv_onnx_run(voice, vin, 6, &vout, 1) != SPCV_ONNX_OK) {
         fprintf(stderr, "FATAL: voice run\n"); return 1;
@@ -340,9 +362,10 @@ int main(int argc, char **argv) {
 
     int64_t out_n = 1;
     for (int i = 0; i < v_ndim; i++) out_n *= v_dims[i];
-    SPCV_TRACE("main", "voice output: [%d] %lld samples", v_ndim, (long long)out_n);
+    SPCV_TRACE("main", "voice output: %lld samples @ %d Hz",
+               (long long)out_n, model_sr);
 
-    /* 13. Write WAV */
+    /* 16. Write WAV at model's native sample rate */
     if (!output) {
         char buf[512];
         const char *base = strrchr(input, '/');
@@ -352,22 +375,24 @@ int main(int argc, char **argv) {
         snprintf(buf, sizeof(buf), "%s_converted.wav", base);
         output = buf;
     }
-    if (spcv_wav_write(output, pcm, out_n, 32000) != 0) {
+    if (spcv_wav_write(output, pcm, out_n, model_sr) != 0) {
         fprintf(stderr, "FATAL: WAV write\n"); return 1;
     }
-    SPCV_TRACE("main", "wrote: %s (%lld samples @ 32 kHz)", output, (long long)out_n);
+    SPCV_TRACE("main", "wrote: %s (%lld samples @ %d Hz)",
+               output, (long long)out_n, model_sr);
 
     /* Cleanup */
     spcv_onnx_free_output(&vout);
-    free(emb80);
+    free(emb_model);
     free(pitch);
-    free(f0_80);
+    free(f0_model);
     free(rnd);
     spcv_onnx_free(hub);
     spcv_onnx_free(voice);
     spcv_onnx_free(rmvpe);
     spcv_onnx_shutdown();
 
-    printf("PASS: %s -> %s (%.2fs)\n", input, output, (double)out_n / 32000.0);
+    printf("PASS: %s -> %s (%.2fs @ %d Hz)\n",
+           input, output, (double)out_n / model_sr, model_sr);
     return 0;
 }
