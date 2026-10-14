@@ -160,6 +160,7 @@ static int read_tensor_desc(const OrtApi *api, OrtSession *sess,
 
 static int     g_ort_initialized = 0;
 static OrtEnv *g_ort_env        = NULL;
+static spcv_ep g_ep             = SPCV_EP_AUTO;
 
 /* ------------------------------------------------------------------ */
 /*  Public API                                                         */
@@ -204,6 +205,10 @@ int spcv_onnx_init(void) {
     return SPCV_ONNX_OK;
 }
 
+void spcv_onnx_set_ep(spcv_ep ep) {
+    g_ep = ep;
+}
+
 void spcv_onnx_shutdown(void) {
     if (!g_ort_initialized) return;
     const OrtApi *api = ort_api();
@@ -229,6 +234,22 @@ int spcv_onnx_load(const char *path, spcv_onnx_session **sess_out) {
     OrtSessionOptions *opts = NULL;
     OrtStatus *s = api->CreateSessionOptions(&opts);
     if (s) { api->ReleaseStatus(s); return SPCV_ONNX_ERR_API; }
+
+    /* Execution provider selection */
+    if (g_ep == SPCV_EP_DML || g_ep == SPCV_EP_AUTO) {
+        s = api->SessionOptionsAppendExecutionProvider(
+            opts, "DmlExecutionProvider", NULL, NULL, 0);
+        if (s) {
+            SPCV_TRACE("onnx", "DML EP unavailable, falling back to CPU");
+            api->ReleaseStatus(s);
+            if (g_ep == SPCV_EP_DML) {
+                api->ReleaseSessionOptions(opts);
+                return SPCV_ONNX_ERR_LOAD;
+            }
+        } else {
+            SPCV_TRACE("onnx", "DML EP enabled");
+        }
+    }
 
     ORTCHAR_T wbuf[2048];
     const ORTCHAR_T *wpath = to_ortchar(path, wbuf, sizeof(wbuf)/sizeof(wbuf[0]));

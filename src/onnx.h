@@ -101,6 +101,22 @@ typedef struct spcv_onnx_session {
 } spcv_onnx_session;
 
 /**
+ * @brief  Execution provider selection.
+ */
+typedef enum {
+    SPCV_EP_AUTO     = 0,  /* try DML, fall back to CPU          */
+    SPCV_EP_DML      = 1,  /* DirectML (Windows D3D12 GPU)       */
+    SPCV_EP_CPU      = 2   /* CPU only                            */
+} spcv_ep;
+
+/**
+ * @brief  Set the preferred execution provider (call before spcv_onnx_load).
+ *
+ * @param  ep  execution provider (SPCV_EP_AUTO / DML / CPU)
+ */
+void spcv_onnx_set_ep(spcv_ep ep);
+
+/**
  * @brief  Global ORT environment (created once, shared across sessions).
  *
  * @return  0 on success, SPCV_ONNX_ERR_API on failure

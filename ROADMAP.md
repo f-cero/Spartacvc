@@ -39,19 +39,20 @@ The engine: audio in → waveform out. No UI, no audio devices.
 
 ### 1A — ONNX path (pre-exported models)
 
-- [ ] CMake project, fetch ONNX Runtime C API via `FetchContent`
-- [ ] Execution-provider selection:
-      - **Windows: DirectML → CPU** (DirectML covers all D3D12 GPUs: AMD + NVIDIA)
-      - **Linux: Vulkan Compute → CPU** (universal, no vendor SDK, old cards included)
+- [x] CMake project, fetch ONNX Runtime C API via `FetchContent`
+- [x] Execution-provider selection:
+      - **Windows: DirectML → CPU** (code in place; needs DML-enabled ORT build)
+      - **Linux: Vulkan Compute → CPU** (TODO — Phase 5)
       - **No CUDA, no ROCm** — keeps binary lean, no 100MB+ DLL bloat
-- [ ] Per-model frame rate: read `sr` + `upsample_rates` from model config,
-      compute native fps, resample HuBERT + f0 to match
-- [ ] Pipeline: resample→16k → HuBERT → resample→model_fps →
+- [x] Per-model frame rate: derived from voice model (256d→32k/80fps, 768d→48k/100fps)
+- [x] Pipeline: resample→16k → HuBERT → resample→model_fps →
       RMVPE → f0 → resample→model_fps → pitch shift → voice decoder → output
-- [ ] Pitch shift: `f0 * 2^(semitones/12)` — simple, effective, user-controlled
-- [ ] Config struct (JSON): `f0_up_key`, `index_rate`, `filter_radius`,
-      `rms_mix_rate`, `protect`, `models_dir`, `backend`
-- [ ] Offline CLI: `spartacvc in.wav -o out.wav --config config.json`
+- [x] Pitch shift: `f0 * 2^(semitones/12)` — simple, effective, user-controlled
+- [x] Config file (JSON): `voice_model`, `hubert_model`, `rmvpe_model`,
+      `pitch_shift_semitones`, `backend`, `output_dir`
+- [x] Offline CLI: `spartacvc in.wav --voice <v> --hubert <h> [--config <c>]`
+- [x] Nahida (768d) E2E: af_heart → Nahida @ 48kHz/100fps ✓
+- [x] Beyoncé (256d) E2E: af_heart → Beyoncé @ 32kHz/80fps ✓
 
 ### 1B — .pth model loading (manifest-based)
 

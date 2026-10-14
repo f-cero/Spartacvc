@@ -205,12 +205,17 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pitch")) { if (++i < argc) pitch_st = atoi(argv[i]); }
         else if (!strcmp(argv[i], "--out")) { if (++i < argc) output = argv[i]; }
         else if (!strcmp(argv[i], "--config")) { if (++i < argc) config_path = argv[i]; }
+        else if (!strcmp(argv[i], "--backend")) { if (++i < argc) {
+            if (!strcmp(argv[i], "dml")) spcv_onnx_set_ep(SPCV_EP_DML);
+            else if (!strcmp(argv[i], "cpu")) spcv_onnx_set_ep(SPCV_EP_CPU);
+            else spcv_onnx_set_ep(SPCV_EP_AUTO);
+        }}
         else if (!strcmp(argv[i], "--debug")) debug = 1;
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             printf("spartacvc — RVC voice conversion in pure C\n");
             printf("usage: spartacvc <input.wav> --voice <v.onnx> --hubert <h.onnx>\n");
             printf("       [--rmvpe <r.onnx>] [--pitch +N] [--out <o.wav>]\n");
-            printf("       [--config <config.json>] [--debug]\n");
+            printf("       [--config <config.json>] [--backend dml|cpu|auto] [--debug]\n");
             return 0;
         }
         else if (argv[i][0] != '-') { if (!input) input = argv[i]; }
@@ -231,6 +236,11 @@ int main(int argc, char **argv) {
                 else if (!strcmp(key, "hubert_model") && !hubert_path) hubert_path = strdup(val);
                 else if (!strcmp(key, "rmvpe_model") && !rmvpe_path) rmvpe_path = strdup(val);
                 else if (!strcmp(key, "pitch_shift_semitones")) { pitch_st = atoi(val); pitch_from_config = 1; }
+                else if (!strcmp(key, "backend")) {
+                    if (!strcmp(val, "dml")) spcv_onnx_set_ep(SPCV_EP_DML);
+                    else if (!strcmp(val, "cpu")) spcv_onnx_set_ep(SPCV_EP_CPU);
+                    else spcv_onnx_set_ep(SPCV_EP_AUTO);
+                }
                 else if (!strcmp(key, "output_dir") && !output) { /* used later */ }
             }
         }
