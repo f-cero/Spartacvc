@@ -21,7 +21,11 @@
  * Usage:
  *   spartacvc.exe input.wav --voice model.onnx --hubert hubert.onnx
  *                  [--rmvpe rmvpe.onnx] [--pitch +12] [--out output.wav]
- *                  [--debug]
+ *                  [--config config.json] [--debug]
+ *
+ * Config file (JSON) keys:
+ *   voice_model, hubert_model, rmvpe_model,
+ *   pitch_shift_semitones, output_dir
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -187,9 +191,11 @@ static float *resample_embed(const float *emb, int64_t t_in, int64_t t_out, int 
 
 int main(int argc, char **argv) {
     const char *input = NULL, *voice_path = NULL, *hubert_path = NULL;
-    const char *rmvpe_path = "models/ozada/rmvpe.onnx";
+    const char *rmvpe_path = NULL;
     const char *output = NULL;
+    const char *config_path = NULL;
     int pitch_st = 0;
+    int pitch_from_config = 0;
     int debug = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -198,15 +204,41 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--rmvpe")) { if (++i < argc) rmvpe_path = argv[i]; }
         else if (!strcmp(argv[i], "--pitch")) { if (++i < argc) pitch_st = atoi(argv[i]); }
         else if (!strcmp(argv[i], "--out")) { if (++i < argc) output = argv[i]; }
+        else if (!strcmp(argv[i], "--config")) { if (++i < argc) config_path = argv[i]; }
         else if (!strcmp(argv[i], "--debug")) debug = 1;
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             printf("spartacvc — RVC voice conversion in pure C\n");
             printf("usage: spartacvc <input.wav> --voice <v.onnx> --hubert <h.onnx>\n");
-            printf("       [--rmvpe <r.onnx>] [--pitch +N] [--out <o.wav>] [--debug]\n");
+            printf("       [--rmvpe <r.onnx>] [--pitch +N] [--out <o.wav>]\n");
+            printf("       [--config <config.json>] [--debug]\n");
             return 0;
         }
         else if (argv[i][0] != '-') { if (!input) input = argv[i]; }
     }
+
+    /* Load config file (fills in any missing values) */
+    if (config_path) {
+        FILE *cf = fopen(config_path, "r");
+        if (!cf) {
+            fprintf(stderr, "error: cannot open config: %s\n", config_path);
+            return 1;
+        }
+        char line[1024];
+        while (fgets(line, sizeof(line), cf)) {
+            char key[256], val[512];
+            if (sscanf(line, " \"%255[^\"]\" : \"%511[^\"]\"", key, val) == 2) {
+                if (!strcmp(key, "voice_model") && !voice_path) voice_path = strdup(val);
+                else if (!strcmp(key, "hubert_model") && !hubert_path) hubert_path = strdup(val);
+                else if (!strcmp(key, "rmvpe_model") && !rmvpe_path) rmvpe_path = strdup(val);
+                else if (!strcmp(key, "pitch_shift_semitones")) { pitch_st = atoi(val); pitch_from_config = 1; }
+                else if (!strcmp(key, "output_dir") && !output) { /* used later */ }
+            }
+        }
+        fclose(cf);
+        SPCV_TRACE("main", "config loaded: %s", config_path);
+    }
+
+    if (!rmvpe_path) rmvpe_path = "models/ozada/rmvpe.onnx";
 
     if (!input || !voice_path || !hubert_path) {
         fprintf(stderr, "error: need input.wav --voice <v.onnx> --hubert <h.onnx>\n");

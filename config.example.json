@@ -1,0 +1,7 @@
+{
+  "voice_model": "models/nahida.onnx",
+  "hubert_model": "models/ozada/vec-768-layer-12.onnx",
+  "rmvpe_model": "models/ozada/rmvpe.onnx",
+  "pitch_shift_semitones": 12,
+  "output_dir": "output/"
+}
