@@ -5,43 +5,75 @@ verifiable — no phase ships "invisible" work.
 
 ---
 
-## Phase 0 — Model assets (unblock everything)
+## Phase 0 — Model assets + validated reference (DONE)
 
-RVC inference needs three ONNX graphs. Torch `.pth` is the community format, so
-we either find pre-exported ONNX or do a **one-off** `.pth → ONNX` export
-(throwaway Python env — never a runtime dependency).
-
-- [x] **HuBERT base** (768-dim features) → `models/ozada/vec-768-layer-12.onnx`
+- [x] **HuBERT base** (768-dim + 256-dim) → `models/ozada/vec-{768,256}-layer-{12,9}.onnx`
 - [x] **RMVPE** f0 extractor → `models/ozada/rmvpe.onnx`
-- [x] **One RVC v2 voice model** → `models/ozada/travisscottv2.onnx`
+- [x] **RVC v2 voice models** (ONNX) → `models/ozada/{travisscottv2,beyonce,lana,sabrina}.onnx`
+- [x] **Nahida .pth** (Genshin JP, 48kHz, 768-dim) → `C:/temp/nahida_extracted/nahida-jp.pth`
 - [x] **Working Python reference** → `tools/reference_pipeline.py` (validated E2E)
-- [ ] Port reference to C (ONNX Runtime C API) + confirm DirectML session runs
+- [x] **Frame-rate bug found & fixed** — each model has its own native rate:
+      `fps = sr / prod(upsample_rates)`. Nahida: 48000/480 = **100fps**.
+      Ozada 32k models: 32000/400 = **80fps**. Must read per-model config.
+- [x] **Pitch direction confirmed** — with correct frame rate, low→high voice
+      conversion raises f0 as expected (af_heart 195Hz → Nahida 202Hz)
 
-**Pipeline (validated):** resample→16k → HuBERT (50fps) → **resample 80fps** →
-RMVPE mel(128,n_fft1024,hop160,fmin30,fmax8k)→cents-decode→f0 → resample 80fps →
-World decoder `phone[1,T,768]`+`pitch`+`pitchf`+`ds`+`rnd[1,192,T]` → audio @32k.
-Voice model native rate = **80fps** (400 samples/frame @32k); output length = input.
+**Pipeline (validated):**
+```
+input WAV → resample 16kHz
+  → HuBERT (50fps, [1,T50,768]) → resample to model_fps ([1,T,768])
+  → mel(n_fft=1024, hop=160, n_mels=128, fmin=30, fmax=8000, log, pad→mult32)
+  → RMVPE → salience [T,360] → cents decode (argmax+9bin avg, thresh 0.05)
+  → f0 Hz → resample to model_fps
+  → pitch = mel-scale int [1,255], pitchf = raw f0 Hz
+  → Voice decoder (phone + pitch + pitchf + ds=0 + rnd=randn(1,192,T)) → audio @sr
+```
 
-**Done when:** a reference C program loads all three ONNX files and converts a
-test WAV with audible, correct output.
+**Done when:** ✅ Python reference produces correct output for multiple voices.
 
 ---
 
-## Phase 1 — Core inference library (portable C)
+## Phase 1 — Core inference engine (C, no Python at runtime)
 
-The engine, no UI, no audio devices. Pure pipeline in + waveform out.
+The engine: audio in → waveform out. No UI, no audio devices.
 
-- [ ] CMake project, fetch ONNX Runtime (C API) via `FetchContent`
-- [ ] Execution-provider selection: **DirectML → CUDA → CPU**, auto or forced
-- [ ] Pipeline: resample → f0 (RMVPE) → features (HuBERT) → convert (voice) →
-      pitch shift → RMS mix → protect → resample out
-- [ ] Config struct (JSON) with all RVC knobs:
-      `f0_up_key`, `index_rate`, `filter_radius`, `rms_mix_rate`, `protect`,
-      `f0_method`, `backend`, `models_dir`
+### 1A — ONNX path (pre-exported models)
+
+- [ ] CMake project, fetch ONNX Runtime C API via `FetchContent`
+- [ ] Execution-provider selection:
+      - **Windows: DirectML → CPU** (DirectML covers all D3D12 GPUs: AMD + NVIDIA)
+      - **Linux: Vulkan Compute → CPU** (universal, no vendor SDK, old cards included)
+      - **No CUDA, no ROCm** — keeps binary lean, no 100MB+ DLL bloat
+- [ ] Per-model frame rate: read `sr` + `upsample_rates` from model config,
+      compute native fps, resample HuBERT + f0 to match
+- [ ] Pipeline: resample→16k → HuBERT → resample→model_fps →
+      RMVPE → f0 → resample→model_fps → pitch shift → voice decoder → output
+- [ ] Pitch shift: `f0 * 2^(semitones/12)` — simple, effective, user-controlled
+- [ ] Config struct (JSON): `f0_up_key`, `index_rate`, `filter_radius`,
+      `rms_mix_rate`, `protect`, `models_dir`, `backend`
 - [ ] Offline CLI: `spartacvc in.wav -o out.wav --config config.json`
 
-**Done when:** `spartacvc in.wav -o out.wav` produces a correct conversion on the
-V100 (DirectML) and on CPU fallback, from a clean build.
+### 1B — .pth model loading (manifest-based)
+
+The user drops a `.pth` file. The app converts it to a `.spacvc` manifest
+directory on first load, then reads the manifest directly.
+
+- [x] **`pth2manifest.py`** — one-time converter: `.pth` → `.spacvc/`
+      (manifest.bin + data/0..N). Extracts tensor names, shapes, dtypes,
+      config. Validated: 457 tensors, 0 mismatches, values match Python.
+- [x] **`manifest.h/c`** — C manifest reader. Loads manifest.bin, reads
+      tensor data from data/ files. Heap-allocated (1.4MB struct).
+- [ ] **`onnx_builder.c`** — instantiate the known RVC v2 architecture
+      (`SynthesizerTrnMs{256,768}NSFsid`) as an ONNX protobuf graph from
+      manifest tensor data. Mechanical: walk the layer list, emit
+      Conv/MatMul/Add/LayerNorm/Attention nodes, set initializers.
+- [ ] **`model_loader.c`** — dispatch by extension:
+      - `.onnx` → load directly into ONNX Runtime
+      - `.pth` → pth2manifest → manifest reader → onnx_builder → cache as `.spacvc`
+- [ ] First-load converts + caches; subsequent loads read manifest directly
+
+**Done when:** `spartacvc in.wav -o out.wav --model nahida-jp.pth` works with
+zero pre-processing, on DirectML (Windows) and CPU. Second run loads from cache.
 
 ---
 
@@ -50,8 +82,9 @@ V100 (DirectML) and on CPU fallback, from a clean build.
 The "double-click the exe" experience.
 
 - [ ] Read/write `config.json` next to the exe (plain JSON, hand-editable)
-- [ ] Win32 config window: model picker, input device, output device,
-      pitch/index/filter/rms/protect sliders, backend selector, Start/Stop
+- [ ] Win32 config window: model picker (scans models/ for .onnx + .pth),
+      input device, output device, pitch shift slider (-24 to +24 semitones),
+      index/filter/rms/protect sliders, backend selector, Start/Stop
 - [ ] System tray icon (`Shell_NotifyIcon`): start/stop, open config, quit
 - [ ] No console window in GUI mode (Windows subsystem)
 
@@ -80,24 +113,47 @@ The converted voice must appear as an *input* device to other apps.
       (VB-Cable / VoiceMeeter / Steam Audio) as the output device; the cable's
       "Input" side is the mic other apps see. Zero driver code.
 - [ ] **Option B (stretch):** bundle a small open-source WASAPI virtual audio
-      driver so `Spartacvς` *is* the "RVC-output" device, no third-party cable.
-      (Larger effort — kernel driver + installer; only after A works.)
+      driver so Spartacvς *is* the "RVC-output" device, no third-party cable.
 
 **Done when:** set Spartacvς output to the virtual cable → select the cable input
 in Discord/a game → the *converted* voice is what they hear.
 
 ---
 
-## Phase 5 — Portability, packaging, docs
+## Phase 5 — Linux port + packaging
 
-- [ ] Linux audio backend (ALSA/Pulse) + CUDA EP path
-- [ ] Single-folder distribution: `spartacvc.exe` + `onnxruntime.dll` + `models/`
+- [ ] **Vulkan Compute EP** for GPU inference (universal: AMD, NVIDIA, Intel,
+      old cards, new cards — anything with Vulkan 1.2+ compute shaders)
+      - If ONNX Runtime's Vulkan EP is immature: write custom Vulkan kernels
+        for the hot ops (Conv1d, MatMul, Attention, LayerNorm)
+      - Fallback: CPU EP (valid for server / low-power use cases)
+- [ ] Linux audio backend (PulseAudio / JACK / ALSA)
+- [ ] Single-folder distribution: `spartacvc` + `libonnxruntime.so` + `models/`
 - [ ] CI: build matrix (Windows x64, Linux x64), smoke test
-- [ ] `tools/download_models.md` finalized; first-contribution guide
 - [ ] Tag `v0.1.0`
 
-**Done when:** a stranger can clone, build, drop in a model, and convert audio
-on Windows or Linux following only the README.
+**Done when:** a stranger can clone, build, drop in a .pth model, and convert
+audio on Windows or Linux following only the README.
+
+---
+
+## Execution provider strategy
+
+| Platform | Primary | Fallback | Notes |
+|----------|---------|----------|-------|
+| Windows | **DirectML** | CPU | Any D3D12 GPU (AMD, NVIDIA, Intel). No CUDA. |
+| Linux | **Vulkan Compute** | CPU | Any Vulkan 1.2+ GPU. No CUDA, no ROCm. Old cards welcome. |
+| Anywhere | CPU | — | Valid for server / offline / low-power. |
+
+**Why no CUDA:**
+- Inflates binary 100MB+ (cudart, cublas, cudnn DLLs)
+- DirectML already covers NVIDIA on Windows at near-CUDA speed for inference
+- Vulkan covers NVIDIA on Linux without vendor SDK
+- Keeps the project vendor-agnostic and the binary lean
+
+**Why no ROCm:**
+- Whitelist of supported GPUs excludes older cards (Vega FE, etc.)
+- Vulkan is the universal floor — if it has compute shaders, it runs
 
 ---
 
@@ -105,13 +161,16 @@ on Windows or Linux following only the README.
 
 - Training / fine-tuning models (use existing RVC tools for that)
 - GPT-SoVITS / other TTS families (different architecture)
-- macOS (CoreAudio backend is a natural later addition, not a launch blocker)
+- macOS (Metal / CoreAudio backend is a natural later addition)
+- General-purpose PyTorch→ONNX converter (we instantiate known architectures only)
 
 ## Risks & mitigations
 
 | Risk | Mitigation |
 | --- | --- |
-| ONNX export of a `.pth` model differs from torch output | Phase 0 reference-match gate before any C work |
-| DirectML op coverage gap on some RVC op | Fall back to CUDA/CPU EP; file upstream; avoid exotic ops in export |
-| Real-time latency on CPU | Clearly label CPU as "offline-first"; GPU recommended for real-time |
+| ONNX Runtime Vulkan EP immature on Linux | Custom Vulkan kernels for hot ops; CPU fallback always works |
+| DirectML op coverage gap on some RVC op | CPU fallback for that op; file upstream; avoid exotic ops |
+| .pth format edge cases | Manifest converter handles all PyTorch ZIP+pickle; C reads simple binary manifest |
+| Real-time latency on CPU | Label CPU as "offline-first"; GPU recommended for real-time |
+| Model architecture variants (v1 vs v2, 256 vs 768 dim) | Config-driven: read dim from .pth, instantiate correct class |
 | Virtual-driver (Phase 4B) complexity | Ship Option A first; 4B is optional stretch |
