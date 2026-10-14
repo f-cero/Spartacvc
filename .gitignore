@@ -1,14 +1,27 @@
-# Large binaries - download separately
-models/
-third_party/onnxruntime/onnxruntime-win-x64-1.20.1/lib/
-third_party/onnxruntime/*.zip
-onnxruntime*.dll
-
 # Build artifacts
-build/
-*.exe
 *.obj
-*.o
-__pycache__/
-*_out.txt
-*.pdb
+*.exe
+*.lib
+*.dll
+!onnxruntime.dll
+!onnxruntime_providers_shared.dll
+spcv_trace.log
+build/
+
+# Models (too large for git)
+models/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Editor
+*.swp
+*~
+.vscode/
+.idea/
+
+# ONNX Runtime (download separately, see README)
+third_party/
+onnxruntime.dll
+onnxruntime_providers_shared.dll
