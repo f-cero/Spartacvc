@@ -1,24 +1,14 @@
-# build
+# Large binaries - download separately
+models/
+third_party/onnxruntime/onnxruntime-win-x64-1.20.1/lib/
+third_party/onnxruntime/*.zip
+onnxruntime*.dll
+
+# Build artifacts
 build/
-out/
+*.exe
 *.obj
 *.o
-*.exe
-*.dll
-!third_party/
-# models (third-party, never commit)
-models/
-*.onnx
-*.pth
-*.index
-*.gguf
-# secrets / local config
-config.json
-*.token
-.env
-# OS / editor
-Thumbs.db
-Desktop.ini
-.vs/
-.vscode/
 __pycache__/
+*_out.txt
+*.pdb
