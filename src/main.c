@@ -36,6 +36,7 @@
 #include "mel.h"
 #include "f0.h"
 #include "debug.h"
+#include "rvc.h"
 
 /* ------------------------------------------------------------------ */
 /*  WAV I/O                                                            */
@@ -264,21 +265,33 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* 2. Load voice model first — its config determines fps and sr */
+    /* 2. Load voice model — .pth (pure C) or .onnx (ORT) */
+    int is_pth = (strlen(voice_path) > 4 && strcmp(voice_path + strlen(voice_path) - 4, ".pth") == 0);
+    rvc_model_t rvc;
     spcv_onnx_session *voice = NULL;
-    SPCV_TRACE("main", "loading voice: %s", voice_path);
-    if (spcv_onnx_load(voice_path, &voice) != SPCV_ONNX_OK) {
-        fprintf(stderr, "FATAL: voice load\n"); return 1;
-    }
-
-    /* 3. Derive per-model parameters from the voice model */
     int model_sr = 0, model_fps = 0, model_dim = 0;
-    if (spcv_voice_model_config(voice, &model_sr, &model_fps, &model_dim) != 0) {
-        fprintf(stderr, "FATAL: cannot determine voice model config\n");
-        spcv_onnx_free(voice);
-        return 1;
+
+    if (is_pth) {
+        SPCV_TRACE("main", "loading .pth voice: %s", voice_path);
+        if (rvc_load(&rvc, voice_path) != 0) {
+            fprintf(stderr, "FATAL: .pth voice load\n"); return 1;
+        }
+        model_sr = rvc.cfg.sr;
+        model_fps = rvc.fps;
+        model_dim = rvc.cfg.ques;
+        SPCV_TRACE("main", ".pth model: sr=%d fps=%d dim=%d", model_sr, model_fps, model_dim);
+    } else {
+        SPCV_TRACE("main", "loading .onnx voice: %s", voice_path);
+        if (spcv_onnx_load(voice_path, &voice) != SPCV_ONNX_OK) {
+            fprintf(stderr, "FATAL: voice load\n"); return 1;
+        }
+        if (spcv_voice_model_config(voice, &model_sr, &model_fps, &model_dim) != 0) {
+            fprintf(stderr, "FATAL: cannot determine voice model config\n");
+            spcv_onnx_free(voice);
+            return 1;
+        }
+        SPCV_TRACE("main", ".onnx model: sr=%d fps=%d dim=%d", model_sr, model_fps, model_dim);
     }
-    SPCV_TRACE("main", "model: sr=%d fps=%d dim=%d", model_sr, model_fps, model_dim);
 
     /* 4. Load HuBERT + RMVPE */
     spcv_onnx_session *hub = NULL, *rmvpe = NULL;
@@ -365,76 +378,108 @@ int main(int argc, char **argv) {
     int64_t *pitch = malloc((size_t)t_model * sizeof(int64_t));
     spcv_f0_quantize(f0_model, (int)t_model, pitch);
 
-    /* 15. Voice decoder (6 inputs) */
+    /* 15. Voice decoder */
     SPCV_TRACE("main", "voice decoder...");
+    float *pcm = NULL;
+    int64_t out_n = 0;
 
-    int64_t phone_lengths = t_model;
-    int64_t ds = 0;
-    int rnd_dim = 192;
-    float *rnd = malloc((size_t)rnd_dim * t_model * sizeof(float));
-    srand(42);
-    for (size_t i = 0; i < (size_t)rnd_dim * t_model; i++)
-        rnd[i] = (float)((rand() / (double)RAND_MAX) * 2.0 - 1.0);
+    if (is_pth) {
+        /* Debug: check HuBERT feature range */
+        {
+            int64_t n = t_model * emb_dim;
+            float mn=1e9f, mx=-1e9f; double sumsq=0;
+            for (int64_t i=0;i<n;i++){if(emb_model[i]<mn)mn=emb_model[i];if(emb_model[i]>mx)mx=emb_model[i];sumsq+=(double)emb_model[i]*emb_model[i];}
+            fprintf(stderr, "[dbg] emb_model: T=%lld dim=%d min=%.4f max=%.4f rms=%.4f\n", (long long)t_model, emb_dim, mn, mx, sqrt(sumsq/n));
+        }
+        /* Pure C path */
+        int out_len = 0;
+        float *out_buf = malloc((size_t)t_model * 480 * sizeof(float));
+        if (rvc_infer(&rvc, emb_model, (int)t_model, pitch, f0_model,
+                      NULL, out_buf, &out_len, NULL) != 0) {
+            fprintf(stderr, "FATAL: rvc_infer\n"); return 1;
+        }
+        pcm = out_buf;
+        out_n = out_len;
+        SPCV_TRACE("main", "rvc output: %lld samples @ %d Hz",
+                   (long long)out_n, model_sr);
+    } else {
+        /* ONNX path */
+        int64_t phone_lengths = t_model;
+        int64_t ds = 0;
+        int rnd_dim = 192;
+        float *rnd = malloc((size_t)rnd_dim * t_model * sizeof(float));
+        srand(42);
+        for (size_t i = 0; i < (size_t)rnd_dim * t_model; i++)
+            rnd[i] = (float)((rand() / (double)RAND_MAX) * 2.0 - 1.0);
 
-    spcv_onnx_input vin[6] = {
-        { .name = voice->inputs[0].name, .data = emb_model,
-          .ndim = 3, .dims = {1, t_model, emb_dim}, .elem_type = 1 },
-        { .name = voice->inputs[1].name, .data = &phone_lengths,
-          .ndim = 1, .dims = {1}, .elem_type = 7 },
-        { .name = voice->inputs[2].name, .data = pitch,
-          .ndim = 2, .dims = {1, t_model}, .elem_type = 7 },
-        { .name = voice->inputs[3].name, .data = f0_model,
-          .ndim = 2, .dims = {1, t_model}, .elem_type = 1 },
-        { .name = voice->inputs[4].name, .data = &ds,
-          .ndim = 1, .dims = {1}, .elem_type = 7 },
-        { .name = voice->inputs[5].name, .data = rnd,
-          .ndim = 3, .dims = {1, rnd_dim, t_model}, .elem_type = 1 }
-    };
-    spcv_onnx_output vout = { .name = voice->outputs[0].name,
-                              .buf = NULL, .buf_size = 0, .ort_value = NULL };
-
-    if (spcv_onnx_run(voice, vin, 6, &vout, 1) != SPCV_ONNX_OK) {
-        fprintf(stderr, "FATAL: voice run\n"); return 1;
+        spcv_onnx_input vin[6] = {
+            { .name = voice->inputs[0].name, .data = emb_model,
+              .ndim = 3, .dims = {1, t_model, emb_dim}, .elem_type = 1 },
+            { .name = voice->inputs[1].name, .data = &phone_lengths,
+              .ndim = 1, .dims = {1}, .elem_type = 7 },
+            { .name = voice->inputs[2].name, .data = pitch,
+              .ndim = 2, .dims = {1, t_model}, .elem_type = 7 },
+            { .name = voice->inputs[3].name, .data = f0_model,
+              .ndim = 2, .dims = {1, t_model}, .elem_type = 1 },
+            { .name = voice->inputs[4].name, .data = &ds,
+              .ndim = 1, .dims = {1}, .elem_type = 7 },
+            { .name = voice->inputs[5].name, .data = rnd,
+              .ndim = 3, .dims = {1, rnd_dim, t_model}, .elem_type = 1 }
+        };
+        spcv_onnx_output vout = { .name = voice->outputs[0].name,
+                                  .buf = NULL, .buf_size = 0, .ort_value = NULL };
+        if (spcv_onnx_run(voice, vin, 6, &vout, 1) != SPCV_ONNX_OK) {
+            fprintf(stderr, "FATAL: voice run\n"); return 1;
+        }
+        int v_ndim; int64_t v_dims[8];
+        spcv_onnx_output_shape(&vout, &v_ndim, v_dims);
+        pcm = (const float *)spcv_onnx_output_data(&vout);
+        if (!pcm) { fprintf(stderr, "FATAL: voice no output\n"); return 1; }
+        out_n = 1;
+        for (int i = 0; i < v_ndim; i++) out_n *= v_dims[i];
+        SPCV_TRACE("main", "onnx output: %lld samples @ %d Hz",
+                   (long long)out_n, model_sr);
+        /* Write WAV before cleanup */
+        if (!output) {
+            char buf[512];
+            const char *base = strrchr(input, '/');
+            if (!base) base = strrchr(input, '\\');
+            if (!base) base = input; else base++;
+            snprintf(buf, sizeof(buf), "%s_converted.wav", base);
+            output = buf;
+        }
+        spcv_wav_write(output, pcm, out_n, model_sr);
+        printf("PASS: %s -> %s (%.2fs @ %d Hz)\n", input, output, (double)out_n / model_sr, model_sr);
+        spcv_onnx_free_output(&vout);
+        free(emb_model); free(pitch); free(f0_model); free(rnd);
+        spcv_onnx_free(hub); spcv_onnx_free(voice); spcv_onnx_free(rmvpe);
+        spcv_onnx_shutdown();
+        return 0;
     }
 
-    int v_ndim; int64_t v_dims[8];
-    spcv_onnx_output_shape(&vout, &v_ndim, v_dims);
-    const float *pcm = (const float *)spcv_onnx_output_data(&vout);
-    if (!pcm) { fprintf(stderr, "FATAL: voice no output\n"); return 1; }
-
-    int64_t out_n = 1;
-    for (int i = 0; i < v_ndim; i++) out_n *= v_dims[i];
-    SPCV_TRACE("main", "voice output: %lld samples @ %d Hz",
-               (long long)out_n, model_sr);
-
-    /* 16. Write WAV at model's native sample rate */
+    /* 16. Write WAV (.pth path) */
     if (!output) {
         char buf[512];
         const char *base = strrchr(input, '/');
         if (!base) base = strrchr(input, '\\');
-        if (!base) base = input;
-        else base++;
+        if (!base) base = input; else base++;
         snprintf(buf, sizeof(buf), "%s_converted.wav", base);
         output = buf;
     }
     if (spcv_wav_write(output, pcm, out_n, model_sr) != 0) {
         fprintf(stderr, "FATAL: WAV write\n"); return 1;
     }
-    SPCV_TRACE("main", "wrote: %s (%lld samples @ %d Hz)",
-               output, (long long)out_n, model_sr);
+    printf("PASS: %s -> %s (%.2fs @ %d Hz) [PTH]\n",
+           input, output, (double)out_n / model_sr, model_sr);
 
     /* Cleanup */
-    spcv_onnx_free_output(&vout);
+    free(pcm);
     free(emb_model);
     free(pitch);
     free(f0_model);
-    free(rnd);
+    rvc_free(&rvc);
     spcv_onnx_free(hub);
-    spcv_onnx_free(voice);
     spcv_onnx_free(rmvpe);
     spcv_onnx_shutdown();
-
-    printf("PASS: %s -> %s (%.2fs @ %d Hz)\n",
-           input, output, (double)out_n / model_sr, model_sr);
     return 0;
 }

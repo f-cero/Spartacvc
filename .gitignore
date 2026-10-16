@@ -25,3 +25,38 @@ Thumbs.db
 third_party/
 onnxruntime.dll
 onnxruntime_providers_shared.dll
+
+# Generated (regenerate with tools/gen_bin.py)
+src/graph_data.h
+src/graph_data.bin
+
+# Debug/test artifacts
+*.txt
+!README.md
+!ROADMAP.md
+C-tempspcv_out.txt
+out.txt
+pth2onnx_out.txt
+min_out.txt
+max_out.txt
+test_*.c
+test_*.bat
+build_*.bat
+!build_pth2onnx.bat
+!build_pth2onnx_debug.bat
+!build_spcv.bat
+dump_*.c
+check_*.c
+find_tensor.c
+trace2.c
+ground_truth.py
+run_*.bat
+
+# ONNX files
+test_minimal.onnx
+*.onnx
+!models/**/*.onnx
+
+# Tool JSON dumps
+tools/onnx_*.json
+tools/*.c

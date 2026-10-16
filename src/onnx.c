@@ -35,18 +35,59 @@
 /* ------------------------------------------------------------------ */
 #include "onnxruntime_c_api.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 /* ------------------------------------------------------------------ */
-/*  Internal helpers                                                   */
+/*  Dynamic loading of onnxruntime.dll                                 */
 /* ------------------------------------------------------------------ */
+
+#ifdef _WIN32
+static HMODULE g_ort_hmod = NULL;
+#endif
 
 /**
  * @brief  Get the OrtApi pointer (cached).
+ *         Uses AddDllDirectory + LoadLibraryEx to ensure we load the
+ *         correct onnxruntime.dll (not the System32 stub).
  * @return OrtApi* or NULL if ORT is not available
  */
 static const OrtApi *ort_api(void) {
     static const OrtApi *api = NULL;
     if (!api) {
+#ifdef _WIN32
+        if (!g_ort_hmod) {
+            /* Get our own directory and load DLL from there */
+            char exe_path[MAX_PATH];
+            GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+            char *slash = strrchr(exe_path, '\\');
+            if (slash) *slash = 0;
+            
+            char full_path[MAX_PATH + 32];
+            snprintf(full_path, sizeof(full_path), "%s\\onnxruntime.dll", exe_path);
+            g_ort_hmod = LoadLibraryExA(full_path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+            if (!g_ort_hmod)
+                g_ort_hmod = LoadLibraryA("onnxruntime.dll");
+            if (!g_ort_hmod) {
+                SPCV_TRACE("onnx", "FATAL: LoadLibrary(onnxruntime.dll) failed: %lu", GetLastError());
+                return NULL;
+            }
+            
+            char loaded_from[MAX_PATH];
+            GetModuleFileNameA(g_ort_hmod, loaded_from, MAX_PATH);
+            SPCV_TRACE("onnx", "loaded onnxruntime.dll from: %s", loaded_from);
+        }
+        typedef const OrtApiBase *(*ort_get_api_base_fn)(void);
+        ort_get_api_base_fn fn = (ort_get_api_base_fn)GetProcAddress(g_ort_hmod, "OrtGetApiBase");
+        if (!fn) {
+            SPCV_TRACE("onnx", "FATAL: GetProcAddress(OrtGetApiBase) failed: %lu", GetLastError());
+            return NULL;
+        }
+        const OrtApiBase *base = fn();
+#else
         const OrtApiBase *base = OrtGetApiBase();
+#endif
         if (base) api = base->GetApi(ORT_API_VERSION);
     }
     return api;
@@ -181,15 +222,9 @@ const char *spcv_onnx_status_str(spcv_onnx_status st) {
 int spcv_onnx_init(void) {
     if (g_ort_initialized) return SPCV_ONNX_OK;
 
-    const OrtApiBase *base = OrtGetApiBase();
-    if (!base) {
-        SPCV_TRACE("onnx", "FATAL: OrtGetApiBase() returned NULL");
-        return SPCV_ONNX_ERR_API;
-    }
-
-    const OrtApi *api = base->GetApi(ORT_API_VERSION);
+    const OrtApi *api = ort_api();
     if (!api) {
-        SPCV_TRACE("onnx", "FATAL: GetApi(%d) returned NULL", ORT_API_VERSION);
+        SPCV_TRACE("onnx", "FATAL: ORT API unavailable");
         return SPCV_ONNX_ERR_API;
     }
 
@@ -215,6 +250,9 @@ void spcv_onnx_shutdown(void) {
     if (api && g_ort_env) api->ReleaseEnv(g_ort_env);
     g_ort_env = NULL;
     g_ort_initialized = 0;
+#ifdef _WIN32
+    if (g_ort_hmod) { FreeLibrary(g_ort_hmod); g_ort_hmod = NULL; }
+#endif
     SPCV_TRACE("onnx", "ORT env released");
 }
 
