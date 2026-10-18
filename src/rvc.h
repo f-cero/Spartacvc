@@ -29,7 +29,8 @@ typedef struct {
     int ff_dim;           /* feedforward hidden dim (192)           */
     int p_dim;            /* encoder dim (192)                      */
     int ques;             /* embedding dim (768 or 256)             */
-    int p_kernel;         /* encoder kernel size                    */
+    int p_kernel;         /* encoder attention kernel size          */
+    int ffn_kernel;       /* FFN conv kernel size (3)               */
     int p_heads;          /* attention heads (6)                    */
     int p_layers;         /* encoder layers (3)                     */
     int upsample_rates[8];   /* e.g. [12,10,2,2]                   */

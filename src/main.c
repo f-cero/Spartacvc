@@ -391,6 +391,16 @@ int main(int argc, char **argv) {
             for (int64_t i=0;i<n;i++){if(emb_model[i]<mn)mn=emb_model[i];if(emb_model[i]>mx)mx=emb_model[i];sumsq+=(double)emb_model[i]*emb_model[i];}
             fprintf(stderr, "[dbg] emb_model: T=%lld dim=%d min=%.4f max=%.4f rms=%.4f\n", (long long)t_model, emb_dim, mn, mx, sqrt(sumsq/n));
         }
+        /* Trace: dump decoder inputs for offline analysis */
+        if (getenv("SPCV_DUMP")) {
+            FILE *df = fopen("scratch/emb_model.bin", "wb");
+            if (df) { fwrite(emb_model, sizeof(float), (size_t)t_model * emb_dim, df); fclose(df); }
+            FILE *pf = fopen("scratch/pitch.bin", "wb");
+            if (pf) { fwrite(pitch, sizeof(int64_t), (size_t)t_model, pf); fclose(pf); }
+            FILE *ff = fopen("scratch/f0_model.bin", "wb");
+            if (ff) { fwrite(f0_model, sizeof(float), (size_t)t_model, ff); fclose(ff); }
+            fprintf(stderr, "[dump] emb_model T=%lld dim=%d, pitch, f0_model -> scratch/\n", (long long)t_model, emb_dim);
+        }
         /* Pure C path */
         int out_len = 0;
         float *out_buf = malloc((size_t)t_model * 480 * sizeof(float));

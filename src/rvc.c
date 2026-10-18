@@ -140,6 +140,11 @@ int rvc_load(rvc_model_t *m, const char *path) {
         const pth_tensor_t *t = pth_find_tensor(&m->pth, "enc_p.encoder.attn_layers.0.conv_q.weight");
         if (t && t->ndim == 3) m->cfg.p_kernel = (int)t->shape[2];
     }
+    if (m->cfg.ffn_kernel == 0) {
+        const pth_tensor_t *t = pth_find_tensor(&m->pth, "enc_p.encoder.ffn_layers.0.conv_1.weight");
+        if (t && t->ndim == 3) m->cfg.ffn_kernel = (int)t->shape[2];
+    }
+    if (m->cfg.ffn_kernel == 0) m->cfg.ffn_kernel = 3;
     
     /* Derive upsample rates from tensor shapes if not set */
     if (m->cfg.upsample_rates[0] == 0) {
@@ -179,6 +184,10 @@ int rvc_load(rvc_model_t *m, const char *path) {
     fprintf(stderr, "[rvc] loading enc_p weights...\n");
     m->emb_phone_w = load_w(m, "enc_p.emb_phone.weight", NULL);
     fprintf(stderr, "[rvc] emb_phone_w=%p\n", (void*)m->emb_phone_w);
+    if (getenv("SPCV_DUMP") && m->emb_phone_w) {
+        FILE *df = fopen("scratch/c_emb_phone_w.bin", "wb");
+        if (df) { fwrite(m->emb_phone_w, sizeof(float), 192 * 768, df); fclose(df); }
+    }
     m->emb_phone_b = load_w(m, "enc_p.emb_phone.bias", NULL);
     m->emb_pitch_w = load_w(m, "enc_p.emb_pitch.weight", NULL);
     if (!m->emb_phone_w || !m->emb_phone_b || !m->emb_pitch_w) { rvc_free(m); return -1; }

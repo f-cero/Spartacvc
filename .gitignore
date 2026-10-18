@@ -7,6 +7,11 @@
 !onnxruntime_providers_shared.dll
 spcv_trace.log
 build/
+build.log
+
+# Debug dumps / scratch
+scratch/
+downloads/
 
 # Models (too large for git)
 models/

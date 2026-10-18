@@ -3,6 +3,7 @@
  * @brief   RVC v2 forward pass — encoder, flow, decoder.
  */
 #include "rvc.h"
+#include "threads.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -14,44 +15,35 @@
 /* Helpers                                                            */
 /* ================================================================== */
 
-/* Conv1d: in[Cin,L] w[Cout,Cin,K] b[Cout] → out[Cout,L] */
+/* Conv1d: in[Cin,L] w[Cout,Cin,K] b[Cout] → out[Cout,L]  (parallel over out) */
+typedef struct { const float *in, *w, *b; float *out; int Cin, L, Cout, K, dil; } conv_ctx;
+static void conv_worker(int i0, int i1, void *arg) {
+    conv_ctx *c = (conv_ctx *)arg;
+    int pad = (c->K / 2) * c->dil;
+    for (int i = i0; i < i1; i++) {
+        int co = i / c->L, l = i - co * c->L;
+        float s = c->b ? c->b[co] : 0;
+        for (int ci = 0; ci < c->Cin; ci++) {
+            const float *wp = &c->w[(size_t)co * c->Cin * c->K + ci * c->K];
+            for (int k = 0; k < c->K; k++) {
+                int p = l - pad + k * c->dil;
+                if (p >= 0 && p < c->L) s += c->in[(size_t)ci * c->L + p] * wp[k];
+            }
+        }
+        c->out[i] = s;
+    }
+}
 static void conv1d(float *out, const float *in, const float *w, const float *b,
                    int Cin, int L, int Cout, int K) {
-    int pad = K / 2;
-    for (int co = 0; co < Cout; co++) {
-        float bv = b ? b[co] : 0;
-        for (int l = 0; l < L; l++) {
-            float s = bv;
-            for (int ci = 0; ci < Cin; ci++) {
-                const float *wp = &w[(size_t)co * Cin * K + ci * K];
-                for (int k = 0; k < K; k++) {
-                    int p = l - pad + k;
-                    if (p >= 0 && p < L) s += in[(size_t)ci * L + p] * wp[k];
-                }
-            }
-            out[(size_t)co * L + l] = s;
-        }
-    }
+    conv_ctx c = { in, w, b, out, Cin, L, Cout, K, 1 };
+    spcv_par_for(Cout * L, conv_worker, &c);
 }
 
 /* Conv1d with dilation: in[Cin,L] w[Cout,Cin,K] b[Cout] → out[Cout,L] */
 static void conv1d_dil(float *out, const float *in, const float *w, const float *b,
                        int Cin, int L, int Cout, int K, int dil) {
-    int pad = (K / 2) * dil;
-    for (int co = 0; co < Cout; co++) {
-        float bv = b ? b[co] : 0;
-        for (int l = 0; l < L; l++) {
-            float s = bv;
-            for (int ci = 0; ci < Cin; ci++) {
-                const float *wp = &w[(size_t)co * Cin * K + ci * K];
-                for (int k = 0; k < K; k++) {
-                    int p = l - pad + k * dil;
-                    if (p >= 0 && p < L) s += in[(size_t)ci * L + p] * wp[k];
-                }
-            }
-            out[(size_t)co * L + l] = s;
-        }
-    }
+    conv_ctx c = { in, w, b, out, Cin, L, Cout, K, dil };
+    spcv_par_for(Cout * L, conv_worker, &c);
 }
 
 /*
@@ -72,25 +64,29 @@ static float *wn_scale_conv1d(const float *v, const float *g, int Cout, int Cin,
 }
 
 /* Conv1d with weight_norm: in[Cin,L] v[Cout,Cin,K] g[Cout] b[Cout] → out[Cout,L] */
+typedef struct { const float *in, *v, *b; float *out, *sc; int Cin, L, Cout, K, dil; } convwn_ctx;
+static void convwn_worker(int i0, int i1, void *arg) {
+    convwn_ctx *c = (convwn_ctx *)arg;
+    int pad = (c->K / 2) * c->dil;
+    for (int i = i0; i < i1; i++) {
+        int co = i / c->L, l = i - co * c->L;
+        float s = 0;
+        float scale = c->sc[co];
+        for (int ci = 0; ci < c->Cin; ci++) {
+            const float *wp = &c->v[(size_t)co * c->Cin * c->K + ci * c->K];
+            for (int k = 0; k < c->K; k++) {
+                int p = l - pad + k * c->dil;
+                if (p >= 0 && p < c->L) s += c->in[(size_t)ci * c->L + p] * wp[k];
+            }
+        }
+        c->out[i] = s * scale + (c->b ? c->b[co] : 0);
+    }
+}
 static void conv1d_wn(float *out, const float *in, const float *v, const float *g,
                       const float *b, int Cin, int L, int Cout, int K) {
     float *sc = wn_scale_conv1d(v, g, Cout, Cin, K);
-    int pad = K / 2;
-    for (int co = 0; co < Cout; co++) {
-        float bv = b ? b[co] : 0;
-        float scale = sc[co];
-        for (int l = 0; l < L; l++) {
-            float s = bv;
-            for (int ci = 0; ci < Cin; ci++) {
-                const float *wp = &v[(size_t)co * Cin * K + ci * K];
-                for (int k = 0; k < K; k++) {
-                    int p = l - pad + k;
-                    if (p >= 0 && p < L) s += in[(size_t)ci * L + p] * wp[k];
-                }
-            }
-            out[(size_t)co * L + l] = s * scale;
-        }
-    }
+    convwn_ctx c = { in, v, b, out, sc, Cin, L, Cout, K, 1 };
+    spcv_par_for(Cout * L, convwn_worker, &c);
     free(sc);
 }
 
@@ -98,22 +94,8 @@ static void conv1d_wn(float *out, const float *in, const float *v, const float *
 static void conv1d_wn_dil(float *out, const float *in, const float *v, const float *g,
                           const float *b, int Cin, int L, int Cout, int K, int dil) {
     float *sc = wn_scale_conv1d(v, g, Cout, Cin, K);
-    int pad = (K / 2) * dil;
-    for (int co = 0; co < Cout; co++) {
-        float bv = b ? b[co] : 0;
-        float scale = sc[co];
-        for (int l = 0; l < L; l++) {
-            float s = bv;
-            for (int ci = 0; ci < Cin; ci++) {
-                const float *wp = &v[(size_t)co * Cin * K + ci * K];
-                for (int k = 0; k < K; k++) {
-                    int p = l - pad + k * dil;
-                    if (p >= 0 && p < L) s += in[(size_t)ci * L + p] * wp[k];
-                }
-            }
-            out[(size_t)co * L + l] = s * scale;
-        }
-    }
+    convwn_ctx c = { in, v, b, out, sc, Cin, L, Cout, K, dil };
+    spcv_par_for(Cout * L, convwn_worker, &c);
     free(sc);
 }
 
@@ -123,17 +105,36 @@ static void conv1d_wn_dil(float *out, const float *in, const float *v, const flo
  *   w[ci,co,k] = g[ci] * v[ci,co,k] / ||v[ci,:,:]||
  *   out[co, t] += in[ci, l] * w[ci,co,k]  where t = l*stride + k - pad
  */
+/* Gather form: out[co,t] = b[co] + sum_{ci,k} in[ci,(t-k+pad)/stride]*v[ci,co,k]*sc[ci]
+ * (valid when (t-k+pad)>=0, (t-k+pad)%stride==0, (t-k+pad)/stride < L).
+ * Identical math to the old scatter form, but each output (co,t) is independent,
+ * so it parallelizes cleanly over the flattened output index. */
+typedef struct { const float *in, *v, *b; float *out, *sc; int Cin, L, Cout, K, stride, pad, L_out; } ctn_ctx;
+static void ctn_worker(int i0, int i1, void *arg) {
+    ctn_ctx *c = (ctn_ctx *)arg;
+    for (int i = i0; i < i1; i++) {
+        int co = i / c->L_out, t = i - co * c->L_out;
+        float s = c->b ? c->b[co] : 0;
+        for (int ci = 0; ci < c->Cin; ci++) {
+            float scale = c->sc[ci];
+            const float *inp = &c->in[(size_t)ci * c->L];
+            const float *vp  = &c->v[(size_t)ci * c->Cout * c->K];
+            for (int k = 0; k < c->K; k++) {
+                int num = t - k + c->pad;
+                if (num < 0) continue;
+                if (num % c->stride != 0) continue;
+                int li = num / c->stride;
+                if (li >= c->L) continue;
+                s += inp[li] * vp[co * c->K + k] * scale;
+            }
+        }
+        c->out[i] = s;
+    }
+}
 static void conv_t1d_wn(float *out, const float *in, const float *v, const float *g,
                         const float *b, int Cin, int L, int Cout, int K, int stride) {
     int OL = L * stride;
     int pad = (K - stride) / 2;
-    /* Zero init + bias */
-    for (int co = 0; co < Cout; co++) {
-        float bv = b ? b[co] : 0;
-        float *op = &out[(size_t)co * OL];
-        for (int l = 0; l < OL; l++) op[l] = bv;
-    }
-    /* Precompute per-ci scale */
     float *sc = malloc((size_t)Cin * sizeof(float));
     for (int ci = 0; ci < Cin; ci++) {
         double s = 0;
@@ -141,25 +142,13 @@ static void conv_t1d_wn(float *out, const float *in, const float *v, const float
         for (int i = 0; i < Cout * K; i++) s += (double)vp[i] * vp[i];
         sc[ci] = (g ? g[ci] : 1.0f) / (sqrtf((float)s) > 0 ? sqrtf((float)s) : 1.0f);
     }
-    for (int ci = 0; ci < Cin; ci++) {
-        float scale = sc[ci];
-        const float *inp = &in[(size_t)ci * L];
-        const float *vp = &v[(size_t)ci * Cout * K];
-        for (int l = 0; l < L; l++) {
-            float v = inp[l];
-            if (v == 0) continue;
-            for (int k = 0; k < K; k++) {
-                int t = l * stride + k - pad;
-                if (t < 0 || t >= OL) continue;
-                for (int co = 0; co < Cout; co++)
-                    out[(size_t)co * OL + t] += v * vp[co * K + k] * scale;
-            }
-        }
-    }
+    ctn_ctx c = { in, v, b, out, sc, Cin, L, Cout, K, stride, pad, OL };
+    spcv_par_for(Cout * OL, ctn_worker, &c);
     free(sc);
 }
 
 /* LayerNorm over channel dim: x[C,L] → out[C,L] */
+/* Python: transpose(1,-1) → F.layer_norm(channels) → transpose(1,-1) back */
 static void layernorm(float *out, const float *x, const float *gamma, const float *beta,
                       int C, int L, float eps) {
     for (int l = 0; l < L; l++) {
@@ -175,13 +164,39 @@ static void layernorm(float *out, const float *x, const float *gamma, const floa
     }
 }
 
+static void leaky_relu_worker(int i0, int i1, void *x) {
+    float *p = (float *)x;
+    for (int i = i0; i < i1; i++) if (p[i] < 0) p[i] *= 0.1f;
+}
 static void leaky_relu(float *x, int n) {
-    for (int i = 0; i < n; i++) if (x[i] < 0) x[i] *= 0.1f;
+    spcv_par_for(n, leaky_relu_worker, x);
+}
+
+/* noise_conv: src[OL] → out[nC,nL], stride conv  out[co,l]=b[co]+sum_k src[l*stride+k-pad]*w[co,k] */
+typedef struct { const float *src, *w, *b; float *out; int nC, nL, nK, stride, pad, OL; } nc_ctx;
+static void nc_worker(int i0, int i1, void *arg) {
+    nc_ctx *c = (nc_ctx *)arg;
+    for (int i = i0; i < i1; i++) {
+        int co = i / c->nL, l = i - co * c->nL;
+        float s = c->b ? c->b[co] : 0;
+        for (int k = 0; k < c->nK; k++) {
+            int in_idx = l * c->stride + k - c->pad;
+            if (in_idx >= 0 && in_idx < c->OL)
+                s += c->src[in_idx] * c->w[co * c->nK + k];
+        }
+        c->out[i] = s;
+    }
+}
+static void noise_conv(float *out, const float *src, const float *w, const float *b,
+                       int nC, int nL, int nK, int stride, int OL) {
+    nc_ctx c = { src, w, b, out, nC, nL, nK, stride, stride / 2, OL };
+    spcv_par_for(nC * nL, nc_worker, &c);
 }
 
 /* ================================================================== */
 /* ResBlock1: 3× (leaky_relu → conv1(dil) → leaky_relu → conv2) + residual */
 /* ================================================================== */
+static int g_rb_dump = 0;
 static void resblock1(float *x, int C, int L, int K,
                       const float *w1[3], const float *b1[3], const float *g1[3],
                       const float *w2[3], const float *b2[3], const float *g2[3],
@@ -194,10 +209,12 @@ static void resblock1(float *x, int C, int L, int K,
         for (int i = 0; i < C * L; i++) xt[i] = x[i] < 0 ? x[i] * 0.1f : x[i];
         /* conv1 with dilation + weight_norm */
         conv1d_wn_dil(h, xt, w1[j], g1[j], b1[j], C, L, C, K, dilations[j]);
+        if (g_rb_dump) { char fn[64]; sprintf(fn, "scratch/rb0_c1_j%d.bin", j); FILE *f = fopen(fn, "wb"); if (f) { fwrite(h, sizeof(float), (size_t)C * L, f); fclose(f); } }
         /* leaky_relu on h */
         leaky_relu(h, C * L);
         /* conv2 (dilation=1) + weight_norm */
         conv1d_wn(s, h, w2[j], g2[j], b2[j], C, L, C, K);
+        if (g_rb_dump) { char fn[64]; sprintf(fn, "scratch/rb0_c2_j%d.bin", j); FILE *f = fopen(fn, "wb"); if (f) { fwrite(s, sizeof(float), (size_t)C * L, f); fclose(f); } }
         /* residual */
         for (int i = 0; i < C * L; i++) x[i] += s[i];
     }
@@ -211,6 +228,7 @@ static void resblock1(float *x, int C, int L, int K,
 /* MultiHeadAttention with relative position embeddings */
 /* x: [C, L], c: [C, L] (context, same as x for self-attn) */
 /* Returns: [C, L] */
+static int g_mha_dump = 0;
 static void mha(float *out, const float *x, const float *c,
                 const float *qw, const float *qb,
                 const float *kw, const float *kb,
@@ -219,6 +237,7 @@ static void mha(float *out, const float *x, const float *c,
                 const float *relk, const float *relv,
                 int C, int L, int H, int max_rel) {
     int hd = C / H;  /* head dim */
+    int W = (max_rel - 1) / 2;  /* window half-size: emb_rel is [1, 2W+1, hd] */
     /* Q, K, V are Conv1d(C,C,1) = pointwise */
     float *Q = malloc((size_t)C * L * sizeof(float));
     float *K = malloc((size_t)C * L * sizeof(float));
@@ -236,10 +255,17 @@ static void mha(float *out, const float *x, const float *c,
             Q[co * L + l] = sq; K[co * L + l] = sk; V[co * L + l] = sv;
         }
     }
-
+    if (getenv("SPCV_DUMP") && g_mha_dump == 0) {
+        char p[256];
+        snprintf(p, sizeof(p), "scratch/mha_Q.bin"); FILE *f=fopen(p,"wb"); if(f){fwrite(Q,sizeof(float),(size_t)C*L,f);fclose(f);}
+        snprintf(p, sizeof(p), "scratch/mha_K.bin"); f=fopen(p,"wb"); if(f){fwrite(K,sizeof(float),(size_t)C*L,f);fclose(f);}
+        snprintf(p, sizeof(p), "scratch/mha_V.bin"); f=fopen(p,"wb"); if(f){fwrite(V,sizeof(float),(size_t)C*L,f);fclose(f);}
+    }
     float scale = 1.0f / sqrtf((float)hd);
     float *ao = malloc((size_t)C * L * sizeof(float));
     memset(ao, 0, (size_t)C * L * sizeof(float));
+    float *ldump_pre  = (getenv("SPCV_DUMP") && g_mha_dump == 0) ? calloc((size_t)L*L, sizeof(float)) : NULL;
+    float *ldump_post = (getenv("SPCV_DUMP") && g_mha_dump == 0) ? calloc((size_t)L*L, sizeof(float)) : NULL;
 
     for (int h = 0; h < H; h++) {
         int hq = h * hd;
@@ -253,30 +279,40 @@ static void mha(float *out, const float *x, const float *c,
                 logits[l2] = s * scale;
                 if (logits[l2] > mx) mx = logits[l2];
             }
-            /* Relative key contribution */
+            /* Relative key contribution: idx = W + (l2-l1), valid for |l1-l2| <= W */
+            if (relk)
             for (int l2 = 0; l2 < L; l2++) {
-                int rel = l1 - l2;
-                if (rel >= 0 && rel < max_rel)
+                int idx = W + (l2 - l1);
+                if (idx >= 0 && idx < max_rel)
                     for (int d = 0; d < hd; d++)
-                        logits[l2] += Q[(hq + d) * L + l1] * relk[rel * hd + d] * scale;
+                        logits[l2] += Q[(hq + d) * L + l1] * relk[idx * hd + d] * scale;
             }
+            if (ldump_pre && h == 0) memcpy(&ldump_pre[l1*L], logits, (size_t)L*sizeof(float));
             /* Softmax */
             float sum = 0;
             for (int l2 = 0; l2 < L; l2++) { logits[l2] = expf(logits[l2] - mx); sum += logits[l2]; }
             for (int l2 = 0; l2 < L; l2++) logits[l2] /= sum;
+            if (ldump_post && h == 0) memcpy(&ldump_post[l1*L], logits, (size_t)L*sizeof(float));
             /* Weighted sum of V + relative V */
             for (int d = 0; d < hd; d++) {
                 float acc = 0;
                 for (int l2 = 0; l2 < L; l2++) {
                     acc += logits[l2] * V[(hq + d) * L + l2];
-                    int rel = l1 - l2;
-                    if (rel >= 0 && rel < max_rel)
-                        acc += logits[l2] * relv[rel * hd + d];
+                    if (relv) {
+                        int idx = W + (l2 - l1);
+                        if (idx >= 0 && idx < max_rel)
+                            acc += logits[l2] * relv[idx * hd + d];
+                    }
                 }
                 ao[(hq + d) * L + l1] = acc;
             }
             free(logits);
         }
+    }
+    if (ldump_pre) {
+        FILE *f=fopen("scratch/mha_ao.bin","wb"); if(f){fwrite(ao,sizeof(float),(size_t)C*L,f);fclose(f);}
+        f=fopen("scratch/mha_ow.bin","wb"); if(f){fwrite(ow,sizeof(float),(size_t)C*C,f);fclose(f);}
+        f=fopen("scratch/mha_ob.bin","wb"); if(f){fwrite(ob,sizeof(float),(size_t)C,f);fclose(f);}
     }
     /* Output conv: pointwise */
     for (int co = 0; co < C; co++) {
@@ -288,6 +324,9 @@ static void mha(float *out, const float *x, const float *c,
             out[co * L + l] = s;
         }
     }
+    if (ldump_pre)  { FILE *f=fopen("scratch/mha_logits_pre.bin","wb"); if(f){fwrite(ldump_pre,sizeof(float),(size_t)L*L,f);fclose(f);} free(ldump_pre); }
+    if (ldump_post) { FILE *f=fopen("scratch/mha_P.bin","wb"); if(f){fwrite(ldump_post,sizeof(float),(size_t)L*L,f);fclose(f);} free(ldump_post); }
+    g_mha_dump++;
     free(Q); free(K); free(V); free(ao);
 }
 
@@ -298,11 +337,20 @@ static void ffn(float *out, const float *x,
                int C, int FF, int L, int K) {
     float *h = malloc((size_t)FF * L * sizeof(float));
     conv1d(h, x, w1, b1, C, L, FF, K);
-    /* GELU: x * 0.5 * (1 + erf(x / sqrt(2))) */
+    /* ReLU (activation=None in Python reference) */
     for (int i = 0; i < FF * L; i++)
-        h[i] = h[i] * 0.5f * (1.0f + erff(h[i] * 0.70710678f));
+        if (h[i] < 0) h[i] = 0;
     conv1d(out, h, w2, b2, FF, L, C, K);
     free(h);
+}
+
+/* Trace: dump a [C,L] float tensor to scratch/<name>.bin when SPCV_DUMP is set. */
+static void dump_tensor(const char *name, const float *x, int C, int L) {
+    if (!getenv("SPCV_DUMP")) return;
+    char path[256];
+    snprintf(path, sizeof(path), "scratch/%s.bin", name);
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(x, sizeof(float), (size_t)C * L, f); fclose(f); }
 }
 
 /* Full encoder forward: phone[T,ques] + pitch[T] → m_p[FC,L], logs_p[FC,L] */
@@ -315,10 +363,11 @@ static int encoder_forward(const rvc_model_t *m,
     int FF = m->cfg.ff_dim;     /* FFN hidden (768) */
     int H = m->cfg.p_heads;     /* heads (2) */
     int NL = m->cfg.p_layers;   /* layers (6) */
-    int K = m->cfg.p_kernel;    /* FFN kernel (3) */
+    int FK = m->cfg.ffn_kernel; /* FFN kernel (3) */
     int FC = m->cfg.filter_channels; /* flow channels (192) */
     int max_rel = m->attn_max_rel;
     int hd = m->attn_head_dim;
+    g_mha_dump = 0;
 
     /* 1. x = emb_phone(phone) + emb_pitch(pitch)  → [T, P] */
     float *x = malloc((size_t)P * T * sizeof(float));
@@ -340,10 +389,12 @@ static int encoder_forward(const rvc_model_t *m,
     for (int i = 0; i < P * T; i++) x[i] *= sc;
     /* 3. x = leaky_relu(x) */
     leaky_relu(x, P * T);
+    dump_tensor("enc_x_emb", x, P, T);
 
     /* 4. Encoder layers (Post-LN) */
     float *y = malloc((size_t)P * T * sizeof(float));
     for (int i = 0; i < NL; i++) {
+        char nm[32]; snprintf(nm, sizeof(nm), "enc_x_L%d", i);
         /* Attention */
         mha(y, x, x,
             m->attn_qw[i], m->attn_qb[i],
@@ -352,14 +403,20 @@ static int encoder_forward(const rvc_model_t *m,
             m->attn_ow[i], m->attn_ob[i],
             m->attn_relk[i], m->attn_relv[i],
             P, T, H, max_rel);
+        if (i == 0) dump_tensor("enc_attn0", y, P, T);  /* mha output, layer 0 only */
         /* Post-LN: x = LN(x + attn) */
         for (int j = 0; j < P * T; j++) y[j] += x[j];
+        if (i == 0) dump_tensor("enc_L0_preln1", y, P, T);
         layernorm(x, y, m->ln1_gamma[i], m->ln1_beta[i], P, T, 1e-5f);
+        if (i == 0) dump_tensor("enc_L0_ln1", x, P, T);
         /* FFN */
-        ffn(y, x, m->ffn1w[i], m->ffn1b[i], m->ffn2w[i], m->ffn2b[i], P, FF, T, K);
+        ffn(y, x, m->ffn1w[i], m->ffn1b[i], m->ffn2w[i], m->ffn2b[i], P, FF, T, FK);
+        if (i == 0) dump_tensor("enc_L0_ffn", y, P, T);
         /* Post-LN: x = LN(x + ffn) */
         for (int j = 0; j < P * T; j++) y[j] += x[j];
+        if (i == 0) dump_tensor("enc_L0_preln2", y, P, T);
         layernorm(x, y, m->ln2_gamma[i], m->ln2_beta[i], P, T, 1e-5f);
+        dump_tensor(nm, x, P, T);
     }
 
     /* 5. Projection: Conv1d(P, 2*FC, 1) → [2*FC, T] */
@@ -387,6 +444,7 @@ static int encoder_forward(const rvc_model_t *m,
 /* ================================================================== */
 
 /* WaveNet: n_layers sublayers with in_layers, res_skip_layers, cond */
+static int g_wn_dump = 0;
 static void wavenet(float *out, const float *x, const float *cond,
                     const float *in_w[3], const float *in_b[3], const float *in_g[3],
                     const float *rs_w[3], const float *rs_b[3], const float *rs_g[3],
@@ -401,6 +459,7 @@ static void wavenet(float *out, const float *x, const float *cond,
         /* in_layer: Conv1d(FC→2FC, K=5) + weight_norm */
         float *x_in = malloc((size_t)Cout_in * L * sizeof(float));
         conv1d_wn(x_in, h, in_w[j], in_g[j], in_b[j], FC, L, Cout_in, K);
+        if (g_wn_dump) { char fn[64]; sprintf(fn, "scratch/wn_xin_%d.bin", j); FILE *f = fopen(fn, "wb"); if (f) { fwrite(x_in, sizeof(float), (size_t)Cout_in * L, f); fclose(f); } }
 
         /* fused_add_tanh_sigmoid_multiply */
         float *acts = malloc((size_t)FC * L * sizeof(float));
@@ -413,12 +472,14 @@ static void wavenet(float *out, const float *x, const float *cond,
                 acts[c * L + l] = tanhf(a) / (1.0f + expf(-b));
             }
         }
+        if (g_wn_dump) { char fn[64]; sprintf(fn, "scratch/wn_acts_%d.bin", j); FILE *f = fopen(fn, "wb"); if (f) { fwrite(acts, sizeof(float), (size_t)FC * L, f); fclose(f); } }
         free(x_in);
 
         /* res_skip: Conv1d(FC→rs_out, K=1) + weight_norm */
         int rs_out = (j < n_layers - 1) ? 2 * FC : FC;
         float *res_skip = malloc((size_t)rs_out * L * sizeof(float));
         conv1d_wn(res_skip, acts, rs_w[j], rs_g[j], rs_b[j], FC, L, rs_out, 1);
+        if (g_wn_dump) { char fn[64]; sprintf(fn, "scratch/wn_rs_%d.bin", j); FILE *f = fopen(fn, "wb"); if (f) { fwrite(res_skip, sizeof(float), (size_t)rs_out * L, f); fclose(f); } }
         free(acts);
 
         if (j < n_layers - 1) {
@@ -442,16 +503,29 @@ static void wavenet(float *out, const float *x, const float *cond,
 static int flow_forward(const rvc_model_t *m,
                         const float *m_p, const float *logs_p,
                         const float *g_emb,
-                        float *z_out, int L) {
+                        float *z_out, int L, uint32_t *seed) {
     int FC = m->cfg.filter_channels;   /* 192 */
     int HP = FC / 2;                   /* 96 */
     int GIN = m->emb_g_dim;            /* 256 (speaker emb dim) */
     int NL = 3;                        /* n_layers in WN */
 
-    /* z starts as [m_p; logs_p] → [FC, L] */
+    /* VAE reparameterization: z = m_p + exp(logs_p) * rnd */
     float *z = malloc((size_t)FC * L * sizeof(float));
-    memcpy(z, m_p, (size_t)HP * L * sizeof(float));
-    memcpy(&z[(size_t)HP * L], logs_p, (size_t)HP * L * sizeof(float));
+    uint32_t s = seed ? *seed : 12345;
+    for (int c = 0; c < FC; c++) {
+        for (int l = 0; l < L; l++) {
+            /* Box-Muller for standard normal */
+            s = s * 1103515245 + 12345;
+            float u1 = (float)((s >> 8) & 0xFFFFF) / (float)(1 << 20);
+            s = s * 1103515245 + 12345;
+            float u2 = (float)((s >> 8) & 0xFFFFF) / (float)(1 << 20);
+            if (u1 < 1e-10f) u1 = 1e-10f;
+            float rnd = sqrtf(-2.0f * logf(u1)) * cosf((float)M_PI * 2.0f * u2);
+            z[c * L + l] = m_p[c * L + l] + expf(logs_p[c * L + l]) * rnd * 0.66666f;
+        }
+    }
+    if (seed) *seed = s;
+    if (getenv("SPCV_DUMP")) { FILE *f = fopen("scratch/vae_z.bin", "wb"); if (f) { fwrite(z, sizeof(float), (size_t)FC * L, f); fclose(f); } }
 
     /* Process 4 flow blocks in reverse order (compact indices 0-3) */
     for (int fi = 3; fi >= 0; fi--) {
@@ -459,6 +533,7 @@ static int flow_forward(const rvc_model_t *m,
         /* pre: Conv1d(HP→FC, 1) */
         float *h = malloc((size_t)FC * L * sizeof(float));
         conv1d(h, z, m->flow_pre_w[idx], m->flow_pre_b[idx], HP, L, FC, 1);
+        if (getenv("SPCV_DUMP") && fi == 3) { FILE *f = fopen("scratch/fb3_pre.bin", "wb"); if (f) { fwrite(h, sizeof(float), (size_t)FC * L, f); fclose(f); } }
 
         /* cond: Conv1d(GIN→2*FC*NL, 1) + weight_norm */
         int CC = 2 * FC * NL;
@@ -467,15 +542,18 @@ static int flow_forward(const rvc_model_t *m,
                   m->flow_cond_b[idx], GIN, 1, CC, 1);
 
         /* WaveNet */
+        g_wn_dump = (getenv("SPCV_DUMP") && fi == 3) ? 1 : 0;
         wavenet(h, h, cond,
                 m->flow_in_w[idx], m->flow_in_b[idx], m->flow_in_g[idx],
                 m->flow_rs_w[idx], m->flow_rs_b[idx], m->flow_rs_g[idx],
                 FC, L, NL);
+        if (getenv("SPCV_DUMP") && fi == 3) { FILE *f = fopen("scratch/fb3_wn.bin", "wb"); if (f) { fwrite(h, sizeof(float), (size_t)FC * L, f); fclose(f); } }
         free(cond);
 
         /* post: Conv1d(FC→HP, 1) — mean_only, so output is HP */
         float *m_out = malloc((size_t)HP * L * sizeof(float));
         conv1d(m_out, h, m->flow_post_w[idx], m->flow_post_b[idx], FC, L, HP, 1);
+        if (getenv("SPCV_DUMP") && fi == 3) { FILE *f = fopen("scratch/fb3_post.bin", "wb"); if (f) { fwrite(m_out, sizeof(float), (size_t)HP * L, f); fclose(f); } }
         free(h);
 
         /* Reverse: x1 = x1 - m (logs=0 since mean_only) */
@@ -492,6 +570,7 @@ static int flow_forward(const rvc_model_t *m,
             memcpy(z, tmp, (size_t)FC * L * sizeof(float));
             free(tmp);
         }
+        if (getenv("SPCV_DUMP")) { char fn[64]; sprintf(fn, "scratch/flow_blk_%d.bin", fi); FILE *f = fopen(fn, "wb"); if (f) { fwrite(z, sizeof(float), (size_t)FC * L, f); fclose(f); } }
     }
     memcpy(z_out, z, (size_t)FC * L * sizeof(float));
     free(z);
@@ -514,6 +593,8 @@ static int decoder_forward(const rvc_model_t *m,
     int sr = m->cfg.sr;                    /* 48000 */
     int OL = L * NUP;                      /* output length */
     int NK = 3;                            /* num_kernels (3 resblocks per stage) */
+
+    if (getenv("SPCV_DEBUG")) fprintf(stderr, "[dec] start L=%d OL=%d NU=%d UP=%d\n", L, OL, NU, UP);
 
     /* --- m_source: generate sine waves from f0 --- */
     /* SineGen: harmonic_num=0, sine_amp=0.1 */
@@ -548,7 +629,22 @@ static int decoder_forward(const rvc_model_t *m,
     float *d = malloc((size_t)UP * L * sizeof(float));
     conv1d(d, z, m->dec_conv_pre_w, m->dec_conv_pre_b, FC, L, UP, 7);
 
-    /* --- cond: Conv1d(gin→UP, 1) — skipped for now (no speaker emb in decoder) --- */
+    /* --- cond: x = x + cond(g)  (pointwise conv, broadcast over time) --- */
+    if (m->dec_cond_w && m->emb_g) {
+        int GIN = m->emb_g_dim;
+        for (int co = 0; co < UP; co++) {
+            float v = m->dec_cond_b[co];
+            for (int ci = 0; ci < GIN; ci++)
+                v += m->dec_cond_w[co * GIN + ci] * m->emb_g[ci];
+            for (int l = 0; l < L; l++)
+                d[co * L + l] += v;
+        }
+    }
+    if (getenv("SPCV_DEC_DUMP")) {
+        FILE *f = fopen("scratch/dec_conv_pre.bin", "wb"); if (f) { fwrite(d, sizeof(float), (size_t)UP * L, f); fclose(f); }
+        f = fopen("scratch/dec_conv_pre_w.bin", "wb"); if (f) { fwrite(m->dec_conv_pre_w, sizeof(float), (size_t)UP * FC * 7, f); fclose(f); }
+        f = fopen("scratch/dec_conv_pre_b.bin", "wb"); if (f) { fwrite(m->dec_conv_pre_b, sizeof(float), (size_t)UP, f); fclose(f); }
+    }
 
     /* --- Upsampling stages --- */
     int cur_C = UP, cur_L = L;
@@ -556,6 +652,7 @@ static int decoder_forward(const rvc_model_t *m,
         int nC = UP / (1 << (u + 1));  /* output channels */
         int rate = m->cfg.upsample_rates[u];
         int nL = cur_L * rate;
+        if (getenv("SPCV_DEBUG")) fprintf(stderr, "[dec] stage u=%d nC=%d rate=%d nL=%d (in C=%d L=%d)\n", u, nC, rate, nL, cur_C, cur_L);
 
         /* leaky_relu */
         leaky_relu(d, cur_C * cur_L);
@@ -564,6 +661,9 @@ static int decoder_forward(const rvc_model_t *m,
         float *d2 = malloc((size_t)nC * nL * sizeof(float));
         conv_t1d_wn(d2, d, m->ups_w[u], m->ups_g[u], m->ups_b[u],
                     cur_C, cur_L, nC, m->cfg.upsample_kernels[u], rate);
+        if (getenv("SPCV_DEC_DUMP") && u == 0) {
+            FILE *f = fopen("scratch/dec_ups0.bin", "wb"); if (f) { fwrite(d2, sizeof(float), (size_t)nC * nL, f); fclose(f); }
+        }
         free(d);
         d = d2;
         cur_C = nC; cur_L = nL;
@@ -578,24 +678,15 @@ static int decoder_forward(const rvc_model_t *m,
             } else {
                 nK = 1; stride = 1;
             }
-            int pad = stride / 2;
             float *ns = malloc((size_t)nC * nL * sizeof(float));
-            for (int co = 0; co < nC; co++) {
-                float bv = m->noise_b[u] ? m->noise_b[u][co] : 0;
-                for (int l = 0; l < nL; l++) {
-                    float s = bv;
-                    for (int k = 0; k < nK; k++) {
-                        int in_idx = l * stride + k - pad;
-                        if (in_idx >= 0 && in_idx < OL)
-                            s += har_source[in_idx] * m->noise_w[u][co * nK + k];
-                    }
-                    ns[co * nL + l] = s;
-                }
-            }
+            noise_conv(ns, har_source, m->noise_w[u], m->noise_b[u], nC, nL, nK, stride, OL);
             for (int i = 0; i < nC * nL; i++) d[i] += ns[i];
             free(ns);
         }
 
+        if (getenv("SPCV_DEC_DUMP") && u == 0) {
+            FILE *f = fopen("scratch/dec_after_ns0.bin", "wb"); if (f) { fwrite(d, sizeof(float), (size_t)cur_C * cur_L, f); fclose(f); }
+        }
         /* ResBlocks (averaged) */
         float *sum = calloc((size_t)cur_C * cur_L, sizeof(float));
         for (int r = 0; r < NK; r++) {
@@ -605,16 +696,24 @@ static int decoder_forward(const rvc_model_t *m,
             int K = m->rb_kernels[rb_idx];
             int C = m->rb_channels[rb_idx];
             int dil[3] = {1, 3, 5};
+            g_rb_dump = (getenv("SPCV_DEC_DUMP") && u == 0 && r == 0) ? 1 : 0;
             resblock1(d3, C, cur_L, K,
                       m->rb_conv1_w[rb_idx], m->rb_conv1_b[rb_idx], m->rb_conv1_g[rb_idx],
                       m->rb_conv2_w[rb_idx], m->rb_conv2_b[rb_idx], m->rb_conv2_g[rb_idx],
                       dil);
             for (int i = 0; i < cur_C * cur_L; i++) sum[i] += d3[i];
+            if (getenv("SPCV_DEC_DUMP") && u == 0 && r == 0) {
+                FILE *f = fopen("scratch/dec_rb0_out.bin", "wb"); if (f) { fwrite(d3, sizeof(float), (size_t)cur_C * cur_L, f); fclose(f); }
+            }
             free(d3);
         }
         for (int i = 0; i < cur_C * cur_L; i++) sum[i] /= NK;
         free(d);
         d = sum;
+        if (getenv("SPCV_DEC_DUMP") && u == 0) {
+            FILE *f = fopen("scratch/dec_stage0.bin", "wb"); if (f) { fwrite(d, sizeof(float), (size_t)cur_C * cur_L, f); fclose(f); }
+        }
+        if (getenv("SPCV_DEBUG")) fprintf(stderr, "[dec] stage u=%d done (C=%d L=%d)\n", u, cur_C, cur_L);
     }
 
     /* --- Final: leaky_relu → conv_post → tanh --- */
@@ -661,26 +760,43 @@ int rvc_infer(const rvc_model_t *m,
               uint32_t *seed) {
     (void)noise; (void)seed;
     int FC = m->cfg.filter_channels;
-
-    /* 1. Encoder */
-    float *m_p = malloc((size_t)FC * T * sizeof(float));
-    float *logs_p = malloc((size_t)FC * T * sizeof(float));
-    if (encoder_forward(m, phone, T, pitch, m_p, logs_p) != 0) {
-        free(m_p); free(logs_p);
-        return -1;
-    }
-    dbg_rms("phone_in", phone, 768, T);
-    dbg_rms("m_p", m_p, FC, T);
-    dbg_rms("logs_p", logs_p, FC, T);
-
-    /* 2. Flow (reverse) with speaker embedding */
     float *z = malloc((size_t)FC * T * sizeof(float));
-    if (flow_forward(m, m_p, logs_p, m->emb_g, z, T) != 0) {
-        free(m_p); free(logs_p); free(z);
-        return -1;
+
+    /* Debug: read z from file (skip encoder+flow) */
+    const char *zfile = getenv("SPCV_Z_FILE");
+    if (zfile) {
+        FILE *f = fopen(zfile, "rb");
+        if (!f) { fprintf(stderr, "[err] cannot open %s\n", zfile); free(z); return -1; }
+        if (fread(z, sizeof(float), (size_t)FC * T, f) != (size_t)FC * T) {
+            fprintf(stderr, "[err] z file too small\n"); fclose(f); free(z); return -1;
+        }
+        fclose(f);
+        fprintf(stderr, "[dbg] loaded z from %s\n", zfile);
+    } else {
+        /* 1. Encoder */
+        float *m_p = malloc((size_t)FC * T * sizeof(float));
+        float *logs_p = malloc((size_t)FC * T * sizeof(float));
+        if (encoder_forward(m, phone, T, pitch, m_p, logs_p) != 0) {
+            free(m_p); free(logs_p); free(z);
+            return -1;
+        }
+        dbg_rms("m_p", m_p, FC, T);
+        dbg_rms("logs_p", logs_p, FC, T);
+        if (getenv("SPCV_DUMP")) {
+            FILE *f = fopen("scratch/m_p.bin", "wb"); if (f) { fwrite(m_p, sizeof(float), (size_t)FC * T, f); fclose(f); }
+            f = fopen("scratch/logs_p.bin", "wb"); if (f) { fwrite(logs_p, sizeof(float), (size_t)FC * T, f); fclose(f); }
+        }
+        /* 2. Flow (reverse) with speaker embedding */
+        if (flow_forward(m, m_p, logs_p, m->emb_g, z, T, seed) != 0) {
+            free(m_p); free(logs_p); free(z);
+            return -1;
+        }
+        dbg_rms("flow_z", z, FC, T);
+        if (getenv("SPCV_DUMP")) {
+            FILE *f = fopen("scratch/flow_z.bin", "wb"); if (f) { fwrite(z, sizeof(float), (size_t)FC * T, f); fclose(f); }
+        }
+        free(m_p); free(logs_p);
     }
-    dbg_rms("flow_z", z, FC, T);
-    free(m_p); free(logs_p);
 
     /* 4. Decoder */
     if (decoder_forward(m, z, T, pitchf, out, out_len) != 0) {
