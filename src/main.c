@@ -197,6 +197,38 @@ static float *resample_embed(const float *emb, int64_t t_in, int64_t t_out, int 
 }
 
 /* ------------------------------------------------------------------ */
+/*  Read all of stdin into a heap buffer (for piped ONNX)              */
+/*                                                                     */
+/*  NOTE: fread() on a redirected stdin is unreliable in this MSVC     */
+/*  environment (returns 0/11 bytes). ReadFile() on the raw handle     */
+/*  works correctly, so we use that on Windows.                        */
+/* ------------------------------------------------------------------ */
+static unsigned char *read_all_stdin(size_t *out_len) {
+    size_t cap = 64u * 1024u * 1024u;   /* 64 MB initial */
+    size_t len = 0;
+    unsigned char *buf = (unsigned char *)malloc(cap);
+    if (!buf) return NULL;
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD got;
+    while (len < cap) {
+        if (!ReadFile(h, buf + len, (DWORD)(cap - len), &got, NULL)) break;
+        if (got == 0) break;
+        len += got;
+        if (len == cap) { cap *= 2; unsigned char *nb = (unsigned char *)realloc(buf, cap); if (!nb) { free(buf); return NULL; } buf = nb; }
+    }
+#else
+    size_t n;
+    while ((n = fread(buf + len, 1, cap - len, stdin)) > 0) {
+        len += n;
+        if (len == cap) { cap *= 2; unsigned char *nb = (unsigned char *)realloc(buf, cap); if (!nb) { free(buf); return NULL; } buf = nb; }
+    }
+#endif
+    *out_len = len;
+    return buf;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -210,6 +242,8 @@ int main(int argc, char **argv) {
     int pitch_st = 0;
     int pitch_from_config = 0;
     int debug = 0;
+    int gpu_id = 0;
+    int voice_stdin = 0;   /* read voice ONNX bytes from stdin (piped) */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--voice")) { if (++i < argc) voice_path = argv[i]; }
@@ -225,13 +259,18 @@ int main(int argc, char **argv) {
             else if (!strcmp(argv[i], "cpu")) spcv_onnx_set_ep(SPCV_EP_CPU);
             else spcv_onnx_set_ep(SPCV_EP_AUTO);
         }}
+        else if (!strcmp(argv[i], "--gpu")) { if (++i < argc) gpu_id = atoi(argv[i]); }
+        else if (!strcmp(argv[i], "--voice-stdin")) voice_stdin = 1;
         else if (!strcmp(argv[i], "--debug")) debug = 1;
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             printf("spartacvc — RVC voice conversion in pure C\n");
             printf("usage: spartacvc <input.wav> --voice <v.pth|v.onnx> --hubert <h.onnx>\n");
             printf("       [--rmvpe <r.onnx>] [--pitch +N] [--out <o.wav>]\n");
             printf("       [--index <idx.bin>] [--index-rate 0.05]\n");
-            printf("       [--config <config.json>] [--backend dml|cpu|auto] [--debug]\n");
+            printf("       [--config <config.json>] [--backend dml|cpu|auto]\n");
+            printf("       [--gpu <id>] [--voice-stdin] [--debug]\n");
+            printf("  --gpu <id>      DML GPU adapter index (0 = primary)\n");
+            printf("  --voice-stdin   read voice ONNX bytes from stdin (piped)\n");
             return 0;
         }
         else if (argv[i][0] != '-') { if (!input) input = argv[i]; }
@@ -268,10 +307,13 @@ int main(int argc, char **argv) {
 
     if (!rmvpe_path) rmvpe_path = "models/ozada/rmvpe.onnx";
 
-    if (!input || !voice_path || !hubert_path) {
-        fprintf(stderr, "error: need input.wav --voice <v.onnx> --hubert <h.onnx>\n");
+    if (!input || (!voice_path && !voice_stdin) || !hubert_path) {
+        fprintf(stderr, "error: need input.wav --voice <v.pth|v.onnx>|--voice-stdin --hubert <h.onnx>\n");
         return 1;
     }
+
+    /* GPU selection (DML adapter index) */
+    spcv_onnx_set_device_id(gpu_id);
 
     if (debug) spcv_debug_set(1);
     SPCV_TRACE("main", "spartacvc starting");
@@ -282,13 +324,30 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* 2. Load voice model — .pth (pure C) or .onnx (ORT) */
-    int is_pth = (strlen(voice_path) > 4 && strcmp(voice_path + strlen(voice_path) - 4, ".pth") == 0);
+    /* 2. Load voice model — .pth (pure C), .onnx (ORT), or ONNX from stdin */
+    int is_pth = (voice_path && strlen(voice_path) > 4 && strcmp(voice_path + strlen(voice_path) - 4, ".pth") == 0);
     rvc_model_t rvc;
     spcv_onnx_session *voice = NULL;
     int model_sr = 0, model_fps = 0, model_dim = 0;
 
-    if (is_pth) {
+    if (voice_stdin) {
+        SPCV_TRACE("main", "reading voice ONNX from stdin...");
+        size_t onnx_len = 0;
+        unsigned char *onnx_buf = read_all_stdin(&onnx_len);
+        if (!onnx_buf || onnx_len == 0) {
+            fprintf(stderr, "FATAL: no ONNX data on stdin\n"); free(onnx_buf); return 1;
+        }
+        SPCV_TRACE("main", "voice ONNX from stdin: %zu bytes", onnx_len);
+        if (spcv_onnx_load_array(onnx_buf, onnx_len, &voice) != SPCV_ONNX_OK) {
+            fprintf(stderr, "FATAL: voice ONNX (stdin) load\n"); free(onnx_buf); return 1;
+        }
+        free(onnx_buf);   /* ORT has copied the model; buffer no longer needed */
+        if (spcv_voice_model_config(voice, &model_sr, &model_fps, &model_dim) != 0) {
+            fprintf(stderr, "FATAL: cannot determine voice model config\n");
+            spcv_onnx_free(voice); return 1;
+        }
+        SPCV_TRACE("main", "voice (stdin): sr=%d fps=%d dim=%d", model_sr, model_fps, model_dim);
+    } else if (is_pth) {
         SPCV_TRACE("main", "loading .pth voice: %s", voice_path);
         if (rvc_load(&rvc, voice_path) != 0) {
             fprintf(stderr, "FATAL: .pth voice load\n"); return 1;

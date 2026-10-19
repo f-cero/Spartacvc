@@ -202,6 +202,7 @@ static int read_tensor_desc(const OrtApi *api, OrtSession *sess,
 static int     g_ort_initialized = 0;
 static OrtEnv *g_ort_env        = NULL;
 static spcv_ep g_ep             = SPCV_EP_AUTO;
+static int     g_device_id      = 0;   /* DML GPU adapter index (0-based) */
 
 /* ------------------------------------------------------------------ */
 /*  Public API                                                         */
@@ -244,6 +245,11 @@ void spcv_onnx_set_ep(spcv_ep ep) {
     g_ep = ep;
 }
 
+void spcv_onnx_set_device_id(int id) {
+    if (id < 0) id = 0;
+    g_device_id = id;
+}
+
 void spcv_onnx_shutdown(void) {
     if (!g_ort_initialized) return;
     const OrtApi *api = ort_api();
@@ -260,77 +266,43 @@ void spcv_onnx_shutdown(void) {
 /*  Session load / free                                                */
 /* ------------------------------------------------------------------ */
 
-int spcv_onnx_load(const char *path, spcv_onnx_session **sess_out) {
-    if (!path || !sess_out) return SPCV_ONNX_ERR_INPUT;
-    *sess_out = NULL;
-
-    const OrtApi *api = ort_api();
-    if (!api) return SPCV_ONNX_ERR_API;
-
-    SPCV_TRACE("onnx", "loading: %s", path);
-
-    OrtSessionOptions *opts = NULL;
-    OrtStatus *s = api->CreateSessionOptions(&opts);
-    if (s) { api->ReleaseStatus(s); return SPCV_ONNX_ERR_API; }
-
-    /* Execution provider selection */
-    if (g_ep == SPCV_EP_DML || g_ep == SPCV_EP_AUTO) {
-        s = api->SessionOptionsAppendExecutionProvider(
-            opts, "DmlExecutionProvider", NULL, NULL, 0);
-        if (s) {
-            SPCV_TRACE("onnx", "DML EP unavailable, falling back to CPU");
-            api->ReleaseStatus(s);
-            if (g_ep == SPCV_EP_DML) {
-                api->ReleaseSessionOptions(opts);
-                return SPCV_ONNX_ERR_LOAD;
-            }
-        } else {
-            SPCV_TRACE("onnx", "DML EP enabled");
-        }
-    }
-
-    ORTCHAR_T wbuf[2048];
-    const ORTCHAR_T *wpath = to_ortchar(path, wbuf, sizeof(wbuf)/sizeof(wbuf[0]));
-    if (!wpath) { api->ReleaseSessionOptions(opts); return SPCV_ONNX_ERR_INPUT; }
-
-    OrtSession *session = NULL;
-    s = api->CreateSession(g_ort_env, wpath, opts, &session);
+/* Apply the configured execution provider (DML + device_id) to opts.
+ * Returns 0 on success (or benign fallback), -1 on hard failure. */
+static int apply_ep(const OrtApi *api, OrtSessionOptions *opts) {
+    if (g_ep != SPCV_EP_DML && g_ep != SPCV_EP_AUTO) return 0; /* CPU */
+    const char *keys[1]  = { "device_id" };
+    char val[16];
+    snprintf(val, sizeof(val), "%d", g_device_id);
+    const char *vals[1] = { val };
+    OrtStatus *s = api->SessionOptionsAppendExecutionProvider(
+        opts, "DmlExecutionProvider", keys, vals, 1);
     if (s) {
-        SPCV_TRACE("onnx", "FAIL: CreateSession: %s", api->GetErrorMessage(s));
+        SPCV_TRACE("onnx", "DML EP unavailable (device_id=%d), falling back to CPU", g_device_id);
         api->ReleaseStatus(s);
-        api->ReleaseSessionOptions(opts);
-        return SPCV_ONNX_ERR_LOAD;
+        if (g_ep == SPCV_EP_DML) return -1;
+        return 0;
     }
+    SPCV_TRACE("onnx", "DML EP enabled (device_id=%d)", g_device_id);
+    return 0;
+}
 
+/* Finish session setup (memory info, allocator, input/output enumeration).
+ * Takes ownership of `session`; releases opts. */
+static int finish_session(const OrtApi *api, OrtSession *session,
+                          OrtSessionOptions *opts, spcv_onnx_session **sess_out) {
+    *sess_out = NULL;
     spcv_onnx_session *sess = (spcv_onnx_session *)calloc(1, sizeof(*sess));
-    if (!sess) {
-        api->ReleaseSession(session);
-        api->ReleaseSessionOptions(opts);
-        return SPCV_ONNX_ERR_ALLOC;
-    }
+    if (!sess) { api->ReleaseSession(session); api->ReleaseSessionOptions(opts); return SPCV_ONNX_ERR_ALLOC; }
     sess->ort_session = session;
+    OrtStatus *s;
 
     s = api->CreateCpuMemoryInfo(OrtDeviceAllocator, OrtMemTypeDefault,
                                   (OrtMemoryInfo **)&sess->ort_meminfo);
-    if (s) {
-        api->ReleaseStatus(s);
-        api->ReleaseSession(session);
-        free(sess);
-        api->ReleaseSessionOptions(opts);
-        return SPCV_ONNX_ERR_API;
-    }
+    if (s) { api->ReleaseStatus(s); api->ReleaseSession(session); free(sess); api->ReleaseSessionOptions(opts); return SPCV_ONNX_ERR_API; }
 
     s = api->GetAllocatorWithDefaultOptions((OrtAllocator **)&sess->ort_alloc);
-    if (s) {
-        api->ReleaseStatus(s);
-        api->ReleaseMemoryInfo((OrtMemoryInfo *)sess->ort_meminfo);
-        api->ReleaseSession(session);
-        free(sess);
-        api->ReleaseSessionOptions(opts);
-        return SPCV_ONNX_ERR_API;
-    }
+    if (s) { api->ReleaseStatus(s); api->ReleaseMemoryInfo((OrtMemoryInfo *)sess->ort_meminfo); api->ReleaseSession(session); free(sess); api->ReleaseSessionOptions(opts); return SPCV_ONNX_ERR_API; }
 
-    /* Enumerate inputs */
     size_t n_in = 0;
     s = api->SessionGetInputCount(session, &n_in);
     if (s) { api->ReleaseStatus(s); goto fail; }
@@ -339,8 +311,6 @@ int spcv_onnx_load(const char *path, spcv_onnx_session **sess_out) {
         if (read_tensor_desc(api, session, i, 1, &sess->inputs[i]) != 0) goto fail;
         SPCV_TRACE("onnx", "  in[%d]: %s type=%d ndim=%d", (int)i, sess->inputs[i].name, sess->inputs[i].elem_type, sess->inputs[i].ndim);
     }
-
-    /* Enumerate outputs */
     size_t n_out = 0;
     s = api->SessionGetOutputCount(session, &n_out);
     if (s) { api->ReleaseStatus(s); goto fail; }
@@ -354,13 +324,64 @@ int spcv_onnx_load(const char *path, spcv_onnx_session **sess_out) {
     api->ReleaseSessionOptions(opts);
     SPCV_TRACE("onnx", "loaded: %d in, %d out", sess->n_inputs, sess->n_outputs);
     return SPCV_ONNX_OK;
-
 fail:
     if (sess->ort_meminfo) api->ReleaseMemoryInfo((OrtMemoryInfo *)sess->ort_meminfo);
     api->ReleaseSession(session);
     free(sess);
     api->ReleaseSessionOptions(opts);
     return SPCV_ONNX_ERR_LOAD;
+}
+
+int spcv_onnx_load(const char *path, spcv_onnx_session **sess_out) {
+    if (!path || !sess_out) return SPCV_ONNX_ERR_INPUT;
+    *sess_out = NULL;
+    const OrtApi *api = ort_api();
+    if (!api) return SPCV_ONNX_ERR_API;
+    SPCV_TRACE("onnx", "loading: %s", path);
+
+    OrtSessionOptions *opts = NULL;
+    OrtStatus *s = api->CreateSessionOptions(&opts);
+    if (s) { api->ReleaseStatus(s); return SPCV_ONNX_ERR_API; }
+    if (apply_ep(api, opts) != 0) { api->ReleaseSessionOptions(opts); return SPCV_ONNX_ERR_LOAD; }
+
+    ORTCHAR_T wbuf[2048];
+    const ORTCHAR_T *wpath = to_ortchar(path, wbuf, sizeof(wbuf)/sizeof(wbuf[0]));
+    if (!wpath) { api->ReleaseSessionOptions(opts); return SPCV_ONNX_ERR_INPUT; }
+
+    OrtSession *session = NULL;
+    s = api->CreateSession(g_ort_env, wpath, opts, &session);
+    if (s) {
+        SPCV_TRACE("onnx", "FAIL: CreateSession: %s", api->GetErrorMessage(s));
+        api->ReleaseStatus(s);
+        api->ReleaseSessionOptions(opts);
+        return SPCV_ONNX_ERR_LOAD;
+    }
+    return finish_session(api, session, opts, sess_out);
+}
+
+int spcv_onnx_load_array(const void *data, size_t len, spcv_onnx_session **sess_out) {
+    if (!data || len == 0 || !sess_out) return SPCV_ONNX_ERR_INPUT;
+    *sess_out = NULL;
+    const OrtApi *api = ort_api();
+    if (!api) return SPCV_ONNX_ERR_API;
+    SPCV_TRACE("onnx", "loading from memory: %zu bytes", len);
+
+    OrtSessionOptions *opts = NULL;
+    OrtStatus *s = api->CreateSessionOptions(&opts);
+    if (s) { api->ReleaseStatus(s); return SPCV_ONNX_ERR_API; }
+    if (apply_ep(api, opts) != 0) { api->ReleaseSessionOptions(opts); return SPCV_ONNX_ERR_LOAD; }
+
+    OrtSession *session = NULL;
+    s = api->CreateSessionFromArray(g_ort_env, data, len, opts, &session);
+    if (s) {
+        const char *msg = api->GetErrorMessage(s);
+        fprintf(stderr, "[spcv] FAIL CreateSessionFromArray: %s\n", msg ? msg : "(no msg)");
+        SPCV_TRACE("onnx", "FAIL: CreateSessionFromArray: %s", msg ? msg : "(no msg)");
+        api->ReleaseStatus(s);
+        api->ReleaseSessionOptions(opts);
+        return SPCV_ONNX_ERR_LOAD;
+    }
+    return finish_session(api, session, opts, sess_out);
 }
 
 void spcv_onnx_free(spcv_onnx_session *sess) {

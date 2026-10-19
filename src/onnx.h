@@ -117,6 +117,16 @@ typedef enum {
 void spcv_onnx_set_ep(spcv_ep ep);
 
 /**
+ * @brief  Set the DML GPU adapter index (0-based, call before spcv_onnx_load).
+ *
+ * Passed to the DmlExecutionProvider as the "device_id" option. Ignored
+ * when the CPU EP is used.
+ *
+ * @param  id  DXGI adapter index (0 = first / primary GPU)
+ */
+void spcv_onnx_set_device_id(int id);
+
+/**
  * @brief  Global ORT environment (created once, shared across sessions).
  *
  * @return  0 on success, SPCV_ONNX_ERR_API on failure
@@ -138,6 +148,19 @@ void spcv_onnx_shutdown(void);
  * Traces (debug): model path, input/output names and shapes.
  */
 int spcv_onnx_load(const char *path, spcv_onnx_session **sess_out);
+
+/**
+ * @brief  Create a session from an in-memory ONNX buffer (no disk file).
+ *
+ * Uses ORT CreateSessionFromArray. Applies the same EP selection as
+ * spcv_onnx_load (see spcv_onnx_set_ep / spcv_onnx_set_device_id).
+ *
+ * @param  data      pointer to the serialized ONNX model
+ * @param  len       length in bytes
+ * @param  sess_out  [out] session handle (caller frees with spcv_onnx_free)
+ * @return  SPCV_ONNX_OK or error code
+ */
+int spcv_onnx_load_array(const void *data, size_t len, spcv_onnx_session **sess_out);
 
 /**
  * @brief  Free a session and its descriptors.
