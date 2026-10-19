@@ -7,9 +7,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+static double spcv_tms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER f,t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
+    return (double)t.QuadPart*1000.0/(double)f.QuadPart;
+#else
+    return (double)clock()*1000.0/CLOCKS_PER_SEC;
+#endif
+}
 
 /* ================================================================== */
 /* Helpers                                                            */
@@ -757,6 +769,10 @@ int rvc_infer(const rvc_model_t *m,
     (void)noise; (void)seed;
     int FC = m->cfg.filter_channels;
     float *z = malloc((size_t)FC * T * sizeof(float));
+    /* timing */
+    double _t_enc=0,_t_flow=0,_t_dec=0;
+    const int _do_time = (getenv("SPCV_TIME") != NULL);
+    double _tt = spcv_tms();
 
     /* Debug: read z from file (skip encoder+flow) */
     const char *zfile = getenv("SPCV_Z_FILE");
@@ -772,10 +788,12 @@ int rvc_infer(const rvc_model_t *m,
         /* 1. Encoder */
         float *m_p = malloc((size_t)FC * T * sizeof(float));
         float *logs_p = malloc((size_t)FC * T * sizeof(float));
+        double _t1=_tt;
         if (encoder_forward(m, phone, T, pitch, m_p, logs_p) != 0) {
             free(m_p); free(logs_p); free(z);
             return -1;
         }
+        _t_enc=spcv_tms()-_t1; if(_do_time) fprintf(stderr,"[time]   encoder        %8.1f ms\n",_t_enc);
         dbg_rms("m_p", m_p, FC, T);
         dbg_rms("logs_p", logs_p, FC, T);
         if (getenv("SPCV_DUMP")) {
@@ -783,10 +801,12 @@ int rvc_infer(const rvc_model_t *m,
             f = fopen("scratch/logs_p.bin", "wb"); if (f) { fwrite(logs_p, sizeof(float), (size_t)FC * T, f); fclose(f); }
         }
         /* 2. Flow (reverse) with speaker embedding */
+        double _t2=spcv_tms();
         if (flow_forward(m, m_p, logs_p, m->emb_g, z, T, seed) != 0) {
             free(m_p); free(logs_p); free(z);
             return -1;
         }
+        _t_flow=spcv_tms()-_t2; if(_do_time) fprintf(stderr,"[time]   flow           %8.1f ms\n",_t_flow);
         dbg_rms("flow_z", z, FC, T);
         if (getenv("SPCV_DUMP")) {
             FILE *f = fopen("scratch/flow_z.bin", "wb"); if (f) { fwrite(z, sizeof(float), (size_t)FC * T, f); fclose(f); }
@@ -795,10 +815,12 @@ int rvc_infer(const rvc_model_t *m,
     }
 
     /* 4. Decoder */
+    double _t3=spcv_tms();
     if (decoder_forward(m, z, T, pitchf, out, out_len) != 0) {
         free(z);
         return -1;
     }
+    _t_dec=spcv_tms()-_t3; if(_do_time) fprintf(stderr,"[time]   decoder        %8.1f ms\n",_t_dec);
     dbg_rms("output", out, 1, *out_len);
     free(z);
     return 0;

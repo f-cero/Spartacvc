@@ -31,12 +31,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+static double spcv_now_ms(void) { LARGE_INTEGER f,t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return (double)t.QuadPart*1000.0/(double)f.QuadPart; }
+#else
+static double spcv_now_ms(void) { return (double)clock()*1000.0/CLOCKS_PER_SEC; }
+#endif
+static double spcv_t0 = 0.0, spcv_t_start = 0.0;
+#define SPCV_MARK(name) do { if(getenv("SPCV_TIME")){ double _n=spcv_now_ms(); fprintf(stderr,"[time] %-22s %8.1f ms (cum %8.1f)\n", name, _n-spcv_t0, _n-spcv_t_start); spcv_t0=_n; } } while(0)
 #include "onnx.h"
 #include "onnx_init.h"
 #include "mel.h"
 #include "f0.h"
 #include "debug.h"
 #include "rvc.h"
+#include "faiss_index.h"
 
 /* ------------------------------------------------------------------ */
 /*  WAV I/O                                                            */
@@ -195,6 +205,8 @@ int main(int argc, char **argv) {
     const char *rmvpe_path = NULL;
     const char *output = NULL;
     const char *config_path = NULL;
+    const char *index_path = NULL;
+    float index_rate = 0.05f;
     int pitch_st = 0;
     int pitch_from_config = 0;
     int debug = 0;
@@ -203,6 +215,8 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--voice")) { if (++i < argc) voice_path = argv[i]; }
         else if (!strcmp(argv[i], "--hubert")) { if (++i < argc) hubert_path = argv[i]; }
         else if (!strcmp(argv[i], "--rmvpe")) { if (++i < argc) rmvpe_path = argv[i]; }
+        else if (!strcmp(argv[i], "--index")) { if (++i < argc) index_path = argv[i]; }
+        else if (!strcmp(argv[i], "--index-rate")) { if (++i < argc) index_rate = (float)atof(argv[i]); }
         else if (!strcmp(argv[i], "--pitch")) { if (++i < argc) pitch_st = atoi(argv[i]); }
         else if (!strcmp(argv[i], "--out")) { if (++i < argc) output = argv[i]; }
         else if (!strcmp(argv[i], "--config")) { if (++i < argc) config_path = argv[i]; }
@@ -214,8 +228,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--debug")) debug = 1;
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             printf("spartacvc — RVC voice conversion in pure C\n");
-            printf("usage: spartacvc <input.wav> --voice <v.onnx> --hubert <h.onnx>\n");
+            printf("usage: spartacvc <input.wav> --voice <v.pth|v.onnx> --hubert <h.onnx>\n");
             printf("       [--rmvpe <r.onnx>] [--pitch +N] [--out <o.wav>]\n");
+            printf("       [--index <idx.bin>] [--index-rate 0.05]\n");
             printf("       [--config <config.json>] [--backend dml|cpu|auto] [--debug]\n");
             return 0;
         }
@@ -242,6 +257,8 @@ int main(int argc, char **argv) {
                     else if (!strcmp(val, "cpu")) spcv_onnx_set_ep(SPCV_EP_CPU);
                     else spcv_onnx_set_ep(SPCV_EP_AUTO);
                 }
+                else if (!strcmp(key, "index") && !index_path) index_path = strdup(val);
+                else if (!strcmp(key, "index_rate")) index_rate = (float)atof(val);
                 else if (!strcmp(key, "output_dir") && !output) { /* used later */ }
             }
         }
@@ -311,6 +328,7 @@ int main(int argc, char **argv) {
     }
     SPCV_TRACE("main", "input: %lld samples @ %d Hz", (long long)w.n, w.sr);
 
+    spcv_t0 = spcv_t_start = spcv_now_ms();
     /* 6. Resample to 16 kHz (HuBERT input rate) */
     float *audio16 = resample_1d(w.data, w.n,
                                   (int64_t)((double)w.n * 16000.0 / w.sr));
@@ -335,6 +353,7 @@ int main(int argc, char **argv) {
     if (!emb) { fprintf(stderr, "FATAL: HuBERT no output\n"); return 1; }
     int64_t t_hub = h_dims[1];
     int emb_dim = (int)h_dims[2];
+    SPCV_MARK("HuBERT");
     SPCV_TRACE("main", "HuBERT: T=%lld dim=%d", (long long)t_hub, emb_dim);
 
     /* 8. Target frame count from model fps */
@@ -350,6 +369,7 @@ int main(int argc, char **argv) {
     if (spcv_mel_compute(audio16, n16, mel, 128) < 0) {
         fprintf(stderr, "FATAL: mel\n"); return 1;
     }
+    SPCV_MARK("mel spectrogram");
     SPCV_TRACE("main", "mel: %d frames x 128", mel_frames);
 
     /* 10. Resample HuBERT embeddings to model fps */
@@ -357,6 +377,34 @@ int main(int argc, char **argv) {
     spcv_onnx_free_output(&hout);
     free(audio16);
     free(w.data);
+
+    /* 10b. FAISS retrieval blend (the "R" in RVC) — optional */
+    SpcvIndex idx;
+    int have_index = 0;
+    if (index_path) {
+        SPCV_TRACE("main", "loading retrieval index: %s", index_path);
+        if (spcv_index_load(index_path, &idx) == 0 && idx.d == emb_dim) {
+            have_index = 1;
+            SPCV_TRACE("main", "index: d=%d nlist=%d ntotal=%lld rate=%.3f",
+                       idx.d, idx.nlist, (long long)idx.ntotal, index_rate);
+            float *retrieved = malloc((size_t)emb_dim * sizeof(float));
+            if (retrieved) {
+                for (int64_t t = 0; t < t_model; t++) {
+                    const float *q = emb_model + t * emb_dim;
+                    spcv_index_retrieve(&idx, q, retrieved);
+                    for (int d = 0; d < emb_dim; d++)
+                        emb_model[t * emb_dim + d] =
+                            retrieved[d] * index_rate + q[d] * (1.0f - index_rate);
+                }
+                free(retrieved);
+            }
+            spcv_index_free(&idx);
+            SPCV_MARK("FAISS retrieval");
+        } else {
+            fprintf(stderr, "[warn] index load failed or dim mismatch (index d vs emb %d); skipping\n", emb_dim);
+            if (idx.centroids) spcv_index_free(&idx);
+        }
+    }
 
     /* 11. f0 extraction (RMVPE) */
     SPCV_TRACE("main", "f0 extraction...");
@@ -367,6 +415,7 @@ int main(int argc, char **argv) {
     }
     free(mel);
 
+    SPCV_MARK("RMVPE f0");
     /* 12. Pitch shift */
     spcv_f0_shift(f0, mel_frames, pitch_st);
 
@@ -410,6 +459,7 @@ int main(int argc, char **argv) {
         }
         pcm = out_buf;
         out_n = out_len;
+        SPCV_MARK("RVC enc+flow+dec");
         SPCV_TRACE("main", "rvc output: %lld samples @ %d Hz",
                    (long long)out_n, model_sr);
     } else {
