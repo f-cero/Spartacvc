@@ -48,6 +48,9 @@ static double spcv_t0 = 0.0, spcv_t_start = 0.0;
 #include "rvc.h"
 #include "faiss_index.h"
 
+/* from gpu_list.c */
+int spcv_list_gpus(void);
+
 /* ------------------------------------------------------------------ */
 /*  WAV I/O                                                            */
 /* ------------------------------------------------------------------ */
@@ -259,7 +262,10 @@ int main(int argc, char **argv) {
             else if (!strcmp(argv[i], "cpu")) spcv_onnx_set_ep(SPCV_EP_CPU);
             else spcv_onnx_set_ep(SPCV_EP_AUTO);
         }}
-        else if (!strcmp(argv[i], "--gpu")) { if (++i < argc) gpu_id = atoi(argv[i]); }
+        else if (!strcmp(argv[i], "--gpu")) { if (++i < argc) {
+            if (!strcmp(argv[i], "list")) { spcv_list_gpus(); return 0; }
+            gpu_id = atoi(argv[i]);
+        }}
         else if (!strcmp(argv[i], "--voice-stdin")) voice_stdin = 1;
         else if (!strcmp(argv[i], "--debug")) debug = 1;
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {

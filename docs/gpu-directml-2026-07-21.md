@@ -42,7 +42,9 @@ model inference via ORT+DML) is done by `spartacvc.exe` in C. The CPU path
 |------|--------|
 | `src/onnx.h` | + `spcv_onnx_set_device_id()`, + `spcv_onnx_load_array()` |
 | `src/onnx.c` | Refactored EP setup into `apply_ep()` (passes `device_id` to DML); split session setup into `finish_session()`; + `spcv_onnx_load_array()` (CreateSessionFromArray) |
-| `src/main.c` | + `--gpu <id>`, + `--voice-stdin`; `read_all_stdin()` uses `ReadFile` (see gotcha) |
+| `src/main.c` | + `--gpu <id>` / `--gpu list`, + `--voice-stdin`; `read_all_stdin()` uses `ReadFile` (see gotcha) |
+| `src/gpu_list.c` | New: `spcv_list_gpus()` — DXGI adapter enumeration for `--gpu list` (links `dxgi.lib`) |
+| `build_spcv.bat` | + `src/gpu_list.c`, + `dxgi.lib` on the link line |
 | `tools/spartacvc_gpu.py` | New: in-memory ONNX export + pipe to spartacvc |
 
 ## Usage
@@ -57,6 +59,11 @@ python tools/spartacvc_gpu.py input.wav \
 
 # Pick a specific GPU adapter (0-based DXGI index):
 python tools/spartacvc_gpu.py ... --gpu 1
+
+# List the available GPU adapters (and their --gpu indices):
+./spartacvc.exe --gpu list
+#   GPU 0: Radeon Vega Frontier Edition   [AMD/ATI, vendor=0x1002 device=0x6863]
+#   GPU 1: Microsoft Basic Render Driver  [other,   vendor=0x1414 device=0x008c]
 
 # CPU fallback (pure C, no ONNX, no Python):
 ./spartacvc.exe input.wav --voice models/voices/nahida-jp.pth \
@@ -85,6 +92,12 @@ api->SessionOptionsAppendExecutionProvider(opts, "DmlExecutionProvider",
 ```
 
 Verified: `--gpu 0` → PASS; `--gpu 1` → FATAL (no valid adapter 1 on this box).
+
+To see which index is which GPU, run `./spartacvc.exe --gpu list` (implemented in
+`src/gpu_list.c`, links `dxgi.lib`). Note: `--gpu list` enumerates **DXGI display
+adapters**; a compute-only GPU (e.g. a headless NVIDIA V100 with no display output)
+may not appear there even though DirectML can still target it — in that case try
+`--gpu` values beyond the listed indices.
 
 ## ONNX export contract
 
