@@ -196,7 +196,6 @@ static void noise_conv(float *out, const float *src, const float *w, const float
 /* ================================================================== */
 /* ResBlock1: 3× (leaky_relu → conv1(dil) → leaky_relu → conv2) + residual */
 /* ================================================================== */
-static int g_rb_dump = 0;
 static void resblock1(float *x, int C, int L, int K,
                       const float *w1[3], const float *b1[3], const float *g1[3],
                       const float *w2[3], const float *b2[3], const float *g2[3],
@@ -209,12 +208,10 @@ static void resblock1(float *x, int C, int L, int K,
         for (int i = 0; i < C * L; i++) xt[i] = x[i] < 0 ? x[i] * 0.1f : x[i];
         /* conv1 with dilation + weight_norm */
         conv1d_wn_dil(h, xt, w1[j], g1[j], b1[j], C, L, C, K, dilations[j]);
-        if (g_rb_dump) { char fn[64]; sprintf(fn, "scratch/rb0_c1_j%d.bin", j); FILE *f = fopen(fn, "wb"); if (f) { fwrite(h, sizeof(float), (size_t)C * L, f); fclose(f); } }
         /* leaky_relu on h */
         leaky_relu(h, C * L);
         /* conv2 (dilation=1) + weight_norm */
         conv1d_wn(s, h, w2[j], g2[j], b2[j], C, L, C, K);
-        if (g_rb_dump) { char fn[64]; sprintf(fn, "scratch/rb0_c2_j%d.bin", j); FILE *f = fopen(fn, "wb"); if (f) { fwrite(s, sizeof(float), (size_t)C * L, f); fclose(f); } }
         /* residual */
         for (int i = 0; i < C * L; i++) x[i] += s[i];
     }
@@ -527,6 +524,17 @@ static int flow_forward(const rvc_model_t *m,
     if (seed) *seed = s;
     if (getenv("SPCV_DUMP")) { FILE *f = fopen("scratch/vae_z.bin", "wb"); if (f) { fwrite(z, sizeof(float), (size_t)FC * L, f); fclose(f); } }
 
+    /* Real reverse flow order: Flip, RCL3, Flip, RCL2, Flip, RCL1, Flip, RCL0.
+     * i.e. an initial channel flip BEFORE the first block, then a flip between
+     * each pair of blocks. (modules.Flip reverses the channel dim.) */
+    {
+        float *tmp = malloc((size_t)FC * L * sizeof(float));
+        for (int c = 0; c < FC; c++)
+            memcpy(&tmp[c * L], &z[(FC - 1 - c) * L], (size_t)L * sizeof(float));
+        memcpy(z, tmp, (size_t)FC * L * sizeof(float));
+        free(tmp);
+    }
+
     /* Process 4 flow blocks in reverse order (compact indices 0-3) */
     for (int fi = 3; fi >= 0; fi--) {
         int idx = fi;  /* compact index */
@@ -596,35 +604,42 @@ static int decoder_forward(const rvc_model_t *m,
 
     if (getenv("SPCV_DEBUG")) fprintf(stderr, "[dec] start L=%d OL=%d NU=%d UP=%d\n", L, OL, NU, UP);
 
-    /* --- m_source: generate sine waves from f0 --- */
-    /* SineGen: harmonic_num=0, sine_amp=0.1 */
-    /* For each sample t: sine = 0.1 * sin(2*pi * f0[t] * t / sr) */
+    /* --- m_source: SineGen + SourceModuleHnNSF (harmonic_num=0) --- */
+    /* Correct algorithm (per porting guide):
+     *   - nearest-interpolate f0 (zero-order hold, frame = t / NUP)
+     *   - phase accumulates in cycles: phase += f0[frame] / sr
+     *   - keep phase in [0,1) for numerical stability
+     *   - clean = 0.1 * sin(2*pi*phase) * uv
+     *   - noise = (uv*0.003 + (1-uv)*0.0333) * randn()
+     *   - output = tanh(w * (clean + noise) + b)                       */
     float *har_source = malloc((size_t)OL * sizeof(float));
-    double phase = 0;
-    for (int t = 0; t < OL; t++) {
-        /* Interpolate f0 from model frames */
-        float f0 = 0;
-        if (pitchf && L > 1) {
-            float ft = (double)t / NUP;
-            int t0 = (int)ft;
-            if (t0 >= L - 1) t0 = L - 2;
-            float frac = ft - t0;
-            f0 = pitchf[t0] * (1 - frac) + pitchf[t0 + 1] * frac;
-        }
-        if (f0 > 0) {
-            phase += 2.0 * M_PI * f0 / sr;
-            har_source[t] = 0.1f * sinf((float)phase);
-        } else {
-            phase = 0;
-            har_source[t] = 0;
-        }
-    }
-    /* m_source: tanh(w * sine + b) */
     float mw = m->m_source_w ? m->m_source_w[0] : 1.0f;
     float mb = m->m_source_b ? m->m_source_b[0] : 0.0f;
-    for (int t = 0; t < OL; t++)
-        har_source[t] = tanhf(mw * har_source[t] + mb);
-
+    int no_noise = (getenv("SPCV_NO_NOISE") != NULL);
+    uint32_t rng = 54321;
+    double phase = 0.0;
+    for (int t = 0; t < OL; t++) {
+        int frame = t / NUP;
+        if (frame >= L) frame = L - 1;
+        float f0 = pitchf ? pitchf[frame] : 0.0f;
+        float uv = (f0 > 0.0f) ? 1.0f : 0.0f;
+        if (uv > 0.0f) {
+            phase += (double)f0 / (double)sr;
+            phase -= floor(phase);
+        }
+        double clean = uv * (0.1 * sin(2.0 * M_PI * phase));
+        double noise = 0.0;
+        if (!no_noise) {
+            double noise_amp = uv * 0.003 + (1.0 - uv) * (0.1 / 3.0);
+            rng = rng * 1103515245u + 12345u;
+            float u1 = (float)((rng >> 8) & 0xFFFFF) / (float)(1 << 20);
+            rng = rng * 1103515245u + 12345u;
+            float u2 = (float)((rng >> 8) & 0xFFFFF) / (float)(1 << 20);
+            if (u1 < 1e-10f) u1 = 1e-10f;
+            noise = noise_amp * (double)sqrtf(-2.0f * logf(u1)) * cosf((float)M_PI * 2.0f * u2);
+        }
+        har_source[t] = (float)tanh((double)mw * (clean + noise) + (double)mb);
+    }
     /* --- conv_pre: Conv1d(FC→UP, K=7) --- */
     float *d = malloc((size_t)UP * L * sizeof(float));
     conv1d(d, z, m->dec_conv_pre_w, m->dec_conv_pre_b, FC, L, UP, 7);
@@ -640,12 +655,6 @@ static int decoder_forward(const rvc_model_t *m,
                 d[co * L + l] += v;
         }
     }
-    if (getenv("SPCV_DEC_DUMP")) {
-        FILE *f = fopen("scratch/dec_conv_pre.bin", "wb"); if (f) { fwrite(d, sizeof(float), (size_t)UP * L, f); fclose(f); }
-        f = fopen("scratch/dec_conv_pre_w.bin", "wb"); if (f) { fwrite(m->dec_conv_pre_w, sizeof(float), (size_t)UP * FC * 7, f); fclose(f); }
-        f = fopen("scratch/dec_conv_pre_b.bin", "wb"); if (f) { fwrite(m->dec_conv_pre_b, sizeof(float), (size_t)UP, f); fclose(f); }
-    }
-
     /* --- Upsampling stages --- */
     int cur_C = UP, cur_L = L;
     for (int u = 0; u < NU; u++) {
@@ -661,9 +670,6 @@ static int decoder_forward(const rvc_model_t *m,
         float *d2 = malloc((size_t)nC * nL * sizeof(float));
         conv_t1d_wn(d2, d, m->ups_w[u], m->ups_g[u], m->ups_b[u],
                     cur_C, cur_L, nC, m->cfg.upsample_kernels[u], rate);
-        if (getenv("SPCV_DEC_DUMP") && u == 0) {
-            FILE *f = fopen("scratch/dec_ups0.bin", "wb"); if (f) { fwrite(d2, sizeof(float), (size_t)nC * nL, f); fclose(f); }
-        }
         free(d);
         d = d2;
         cur_C = nC; cur_L = nL;
@@ -684,9 +690,6 @@ static int decoder_forward(const rvc_model_t *m,
             free(ns);
         }
 
-        if (getenv("SPCV_DEC_DUMP") && u == 0) {
-            FILE *f = fopen("scratch/dec_after_ns0.bin", "wb"); if (f) { fwrite(d, sizeof(float), (size_t)cur_C * cur_L, f); fclose(f); }
-        }
         /* ResBlocks (averaged) */
         float *sum = calloc((size_t)cur_C * cur_L, sizeof(float));
         for (int r = 0; r < NK; r++) {
@@ -696,23 +699,16 @@ static int decoder_forward(const rvc_model_t *m,
             int K = m->rb_kernels[rb_idx];
             int C = m->rb_channels[rb_idx];
             int dil[3] = {1, 3, 5};
-            g_rb_dump = (getenv("SPCV_DEC_DUMP") && u == 0 && r == 0) ? 1 : 0;
             resblock1(d3, C, cur_L, K,
                       m->rb_conv1_w[rb_idx], m->rb_conv1_b[rb_idx], m->rb_conv1_g[rb_idx],
                       m->rb_conv2_w[rb_idx], m->rb_conv2_b[rb_idx], m->rb_conv2_g[rb_idx],
                       dil);
             for (int i = 0; i < cur_C * cur_L; i++) sum[i] += d3[i];
-            if (getenv("SPCV_DEC_DUMP") && u == 0 && r == 0) {
-                FILE *f = fopen("scratch/dec_rb0_out.bin", "wb"); if (f) { fwrite(d3, sizeof(float), (size_t)cur_C * cur_L, f); fclose(f); }
-            }
             free(d3);
         }
         for (int i = 0; i < cur_C * cur_L; i++) sum[i] /= NK;
         free(d);
         d = sum;
-        if (getenv("SPCV_DEC_DUMP") && u == 0) {
-            FILE *f = fopen("scratch/dec_stage0.bin", "wb"); if (f) { fwrite(d, sizeof(float), (size_t)cur_C * cur_L, f); fclose(f); }
-        }
         if (getenv("SPCV_DEBUG")) fprintf(stderr, "[dec] stage u=%d done (C=%d L=%d)\n", u, cur_C, cur_L);
     }
 

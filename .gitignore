@@ -65,3 +65,4 @@ test_minimal.onnx
 # Tool JSON dumps
 tools/onnx_*.json
 tools/*.c
+tools/__pycache__/

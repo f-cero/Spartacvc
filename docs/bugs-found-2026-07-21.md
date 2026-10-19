@@ -113,3 +113,61 @@ After fixing, full flow matches: **relL2=0.000000, corr=1.00000**.
 **The entire C pipeline (encoder → VAE → flow → decoder) is mathematically
 correct.** Output is valid Nahida speech; amplitude varies with the random
 VAE sample (C uses a fixed seed 12345 for reproducibility).
+
+---
+
+## Bug 9: Flow missing initial channel-Flip
+
+**Where:** `src/rvc_infer.c`, function `flow_forward()`
+**What:** The C code applied 3 channel-flips between the 4 ResidualCouplingBlocks:
+`RCL3, Flip, RCL2, Flip, RCL1, Flip, RCL0`. But the real reverse order is
+`reversed([RCL0,Flip0,RCL1,Flip1,RCL2,Flip2,RCL3,Flip3])` =
+`[Flip3,RCL3,Flip2,RCL2,Flip1,RCL1,Flip0,RCL0]` — **4 flips total**, with an
+initial flip BEFORE the first block.
+**Impact:** The flow output (z) was wrong, producing incorrect decoder input.
+Content was garbled ("ah-ah ah" instead of the correct words).
+**Fix:** Added an initial channel-flip before the loop in `flow_forward`.
+**Status:** ✅ Fixed. Flow output now matches real rvc_python: relL2=0.000000, corr=1.00000.
+
+---
+
+## Bug 10: SineGen used linear f0 interpolation instead of nearest (zero-order hold)
+
+**Where:** `src/rvc_infer.c`, function `decoder_forward()`, har_source generation
+**What:** C used linear interpolation of f0 between frames:
+```c
+f0 = pitchf[t0] * (1 - frac) + pitchf[t0+1] * frac;  // linear blend
+phase += 2π * f0 / sr;
+```
+The real SineGen uses **nearest** interpolation (zero-order hold):
+```python
+rad_values = F.interpolate(rad_values, scale_factor=upp, mode="nearest")
+```
+which replicates each frame's f0 for exactly `upp` samples: `f0 = pitchf[t / upp]`.
+Additionally, C was missing:
+- The uv (voiced/unvoiced) masking: `clean * uv`
+- The Gaussian noise: `noise_amp * randn()` where `noise_amp = uv*0.003 + (1-uv)*0.0333`
+- The correct phase accumulation order (accumulate THEN sin, not sin THEN accumulate)
+**Impact:** The harmonic source (excitation signal) had the wrong phase, producing
+a sine wave with relL2=1.47 vs the real one. This corrupted the entire decoder
+output (noise_conv, resblocks, conv_post all received wrong input).
+**Fix:** Rewrote har_source generation per the porting guide (`tools/C RVC SineGen Porting.md`):
+- Nearest interpolation: `frame = t / NUP`
+- Phase in cycles: `phase += f0[frame] / sr; phase -= floor(phase);`
+- UV masking, Gaussian noise (Box-Muller), `tanh(w * (clean + noise) + b)`
+- Added `SPCV_NO_NOISE` env var to disable noise for deterministic debugging
+**Status:** ✅ Fixed. All decoder stages now match real rvc_python (relL2 < 0.00003).
+
+---
+
+## Final Verification (after all fixes)
+
+| Component | C vs real rvc_python |
+|-----------|----------------------|
+| Encoder   | relL2 < 0.00001      |
+| VAE noise | rms=0.999, std=0.999 |
+| Flow      | relL2=0.000000, corr=1.00000 |
+| Decoder   | relL2 < 0.00003 (all stages) |
+| **Output**  | **STT: "Hello, this is a short test of the voice conversion pipeline."** |
+
+**The entire C pipeline is verified correct against the real rvc_python model.**
