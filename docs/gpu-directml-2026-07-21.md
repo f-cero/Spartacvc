@@ -62,8 +62,10 @@ python tools/spartacvc_gpu.py ... --gpu 1
 
 # List the available GPU adapters (and their --gpu indices):
 ./spartacvc.exe --gpu list
-#   GPU 0: Radeon Vega Frontier Edition   [AMD/ATI, vendor=0x1002 device=0x6863]
-#   GPU 1: Microsoft Basic Render Driver  [other,   vendor=0x1414 device=0x008c]
+#   GPU 0: Radeon Vega Frontier Edition   [AMD/ATI, vendor=0x1002, vram=23.6 GB, hardware]
+#          DirectML: YES   ->  --gpu 0
+#   GPU 1: Microsoft Basic Render Driver  [Microsoft, vendor=0x1414, vram=0.0 GB, software]
+#          DirectML: YES   ->  --gpu 1
 
 # CPU fallback (pure C, no ONNX, no Python):
 ./spartacvc.exe input.wav --voice models/voices/nahida-jp.pth \
@@ -91,13 +93,22 @@ api->SessionOptionsAppendExecutionProvider(opts, "DmlExecutionProvider",
                                            keys, vals, 1);
 ```
 
-Verified: `--gpu 0` → PASS; `--gpu 1` → FATAL (no valid adapter 1 on this box).
+Verified: `--gpu 0` (Vega FE) → PASS; `--gpu 1` (software) → FATAL (DML EP
+cannot run the model on the software adapter).
 
 To see which index is which GPU, run `./spartacvc.exe --gpu list` (implemented in
-`src/gpu_list.c`, links `dxgi.lib`). Note: `--gpu list` enumerates **DXGI display
-adapters**; a compute-only GPU (e.g. a headless NVIDIA V100 with no display output)
-may not appear there even though DirectML can still target it — in that case try
-`--gpu` values beyond the listed indices.
+`src/gpu_list.c`, links `dxgi.lib` + `d3d12.lib`; DirectML loaded dynamically).
+The probe checks D3D12CreateDevice + DMLCreateDevice per adapter.
+
+### Note on headless datacenter GPUs
+
+The Tesla PG500-216 (32GB, TCC mode) on this box is **not visible to DXGI**
+and therefore cannot be targeted via `--gpu`. TCC-mode GPUs have no display
+output and are hidden from the DXGI adapter list. They are only accessible via
+CUDA (which Spartacvς does not use) or WDDM mode (which requires a display driver).
+
+The DML EP's `device_id` is the **DXGI adapter index** (0-based). Only
+DXGI-visible GPUs can be targeted.
 
 ## ONNX export contract
 
