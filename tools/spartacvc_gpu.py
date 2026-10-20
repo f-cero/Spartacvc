@@ -14,7 +14,7 @@ f0, FAISS retrieval, WAV output) is done by spartacvc in C.
 Usage:
   python tools/spartacvc_gpu.py <input.wav> --voice <v.pth> --hubert <h.onnx> \
       [--rmvpe <r.onnx>] [--gpu 0] [--pitch +2] [--out out.wav] \
-      [--index <idx.bin>] [--index-rate 0.05] [--backend dml]
+      [--index <idx.bin>] [--index-rate 0.05] [--backend cuda|dml|vulkan|cpu|auto]
 
 Notes:
   - Requires: torch, rvc_python (for SynthesizerTrnMsNSFsidM).
@@ -94,7 +94,7 @@ def main():
     ap.add_argument("--hubert", required=True, help="HuBERT .onnx")
     ap.add_argument("--rmvpe", default=None, help="RMVPE .onnx (optional)")
     ap.add_argument("--gpu", type=int, default=0, help="DML GPU adapter index (0=primary)")
-    ap.add_argument("--backend", default="dml", choices=["dml", "cpu", "auto"], help="execution provider")
+    ap.add_argument("--backend", default="auto", choices=["cuda", "dml", "vulkan", "cpu", "auto"], help="execution provider")
     ap.add_argument("--pitch", type=int, default=0, help="pitch shift semitones")
     ap.add_argument("--out", default=None, help="output WAV (default: <input>_spartacvc.wav)")
     ap.add_argument("--index", default=None, help="FAISS index .bin (optional)")

@@ -247,6 +247,8 @@ int main(int argc, char **argv) {
     int debug = 0;
     int gpu_id = 0;
     int voice_stdin = 0;   /* read voice ONNX bytes from stdin (piped) */
+    spcv_ep main_ep = SPCV_EP_AUTO;   /* track chosen EP for aux-model selection */
+    int aux_override = -1;            /* -1=auto, 0=force GPU, 1=force CPU */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--voice")) { if (++i < argc) voice_path = argv[i]; }
@@ -258,10 +260,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--out")) { if (++i < argc) output = argv[i]; }
         else if (!strcmp(argv[i], "--config")) { if (++i < argc) config_path = argv[i]; }
         else if (!strcmp(argv[i], "--backend")) { if (++i < argc) {
-            if (!strcmp(argv[i], "dml")) spcv_onnx_set_ep(SPCV_EP_DML);
-            else if (!strcmp(argv[i], "cpu")) spcv_onnx_set_ep(SPCV_EP_CPU);
-            else spcv_onnx_set_ep(SPCV_EP_AUTO);
+            if (!strcmp(argv[i], "cuda")) main_ep = SPCV_EP_CUDA;
+            else if (!strcmp(argv[i], "dml")) main_ep = SPCV_EP_DML;
+            else if (!strcmp(argv[i], "vulkan")) main_ep = SPCV_EP_VULKAN;
+            else if (!strcmp(argv[i], "cpu")) main_ep = SPCV_EP_CPU;
+            else main_ep = SPCV_EP_AUTO;
+            spcv_onnx_set_ep(main_ep);
         }}
+        else if (!strcmp(argv[i], "--aux-cpu")) aux_override = 1;
+        else if (!strcmp(argv[i], "--aux-gpu")) aux_override = 0;
         else if (!strcmp(argv[i], "--gpu")) { if (++i < argc) {
             if (!strcmp(argv[i], "list")) { spcv_list_gpus(); return 0; }
             gpu_id = atoi(argv[i]);
@@ -273,9 +280,10 @@ int main(int argc, char **argv) {
             printf("usage: spartacvc <input.wav> --voice <v.pth|v.onnx> --hubert <h.onnx>\n");
             printf("       [--rmvpe <r.onnx>] [--pitch +N] [--out <o.wav>]\n");
             printf("       [--index <idx.bin>] [--index-rate 0.05]\n");
-            printf("       [--config <config.json>] [--backend dml|cpu|auto]\n");
+            printf("       [--config <config.json>] [--backend cuda|dml|vulkan|cpu|auto]\n");
             printf("       [--gpu <id>] [--voice-stdin] [--debug]\n");
-            printf("  --gpu <id>      DML GPU adapter index (0 = primary)\n");
+            printf("  --backend     cuda (NVIDIA) | dml (Windows GPU) | vulkan (AMD) | cpu | auto\n");
+            printf("  --gpu <id>    device index (CUDA ordinal / DXGI adapter / Vulkan device)\n");
             printf("  --voice-stdin   read voice ONNX bytes from stdin (piped)\n");
             return 0;
         }
@@ -298,7 +306,9 @@ int main(int argc, char **argv) {
                 else if (!strcmp(key, "rmvpe_model") && !rmvpe_path) rmvpe_path = strdup(val);
                 else if (!strcmp(key, "pitch_shift_semitones")) { pitch_st = atoi(val); pitch_from_config = 1; }
                 else if (!strcmp(key, "backend")) {
-                    if (!strcmp(val, "dml")) spcv_onnx_set_ep(SPCV_EP_DML);
+                    if (!strcmp(val, "cuda")) spcv_onnx_set_ep(SPCV_EP_CUDA);
+                    else if (!strcmp(val, "dml")) spcv_onnx_set_ep(SPCV_EP_DML);
+                    else if (!strcmp(val, "vulkan")) spcv_onnx_set_ep(SPCV_EP_VULKAN);
                     else if (!strcmp(val, "cpu")) spcv_onnx_set_ep(SPCV_EP_CPU);
                     else spcv_onnx_set_ep(SPCV_EP_AUTO);
                 }
@@ -375,14 +385,23 @@ int main(int argc, char **argv) {
         SPCV_TRACE("main", ".onnx model: sr=%d fps=%d dim=%d", model_sr, model_fps, model_dim);
     }
 
-    /* 4. Load HuBERT + RMVPE */
+    /* 4. Load HuBERT + RMVPE (aux models).
+     * By default, when the voice model uses a GPU EP, run the small aux models
+     * on CPU (faster to load, avoids cuDNN-RNN issues on some GPUs, and they're
+     * not the bottleneck). Override with --aux-gpu to force them onto the GPU. */
+    spcv_ep aux_ep = main_ep;
+    int main_is_gpu = (main_ep == SPCV_EP_CUDA || main_ep == SPCV_EP_DML || main_ep == SPCV_EP_VULKAN);
+    if (aux_override == 1) aux_ep = SPCV_EP_CPU;
+    else if (aux_override == 0) aux_ep = main_ep;      /* force GPU */
+    else if (main_is_gpu) aux_ep = SPCV_EP_CPU;         /* auto: small aux models on CPU */
+    SPCV_TRACE("main", "aux models (HuBERT/RMVPE) on EP=%d", (int)aux_ep);
     spcv_onnx_session *hub = NULL, *rmvpe = NULL;
     SPCV_TRACE("main", "loading HuBERT: %s", hubert_path);
-    if (spcv_onnx_load(hubert_path, &hub) != SPCV_ONNX_OK) {
+    if (spcv_onnx_load_ep(hubert_path, aux_ep, &hub) != SPCV_ONNX_OK) {
         fprintf(stderr, "FATAL: HuBERT load\n"); return 1;
     }
     SPCV_TRACE("main", "loading RMVPE: %s", rmvpe_path);
-    if (spcv_onnx_load(rmvpe_path, &rmvpe) != SPCV_ONNX_OK) {
+    if (spcv_onnx_load_ep(rmvpe_path, aux_ep, &rmvpe) != SPCV_ONNX_OK) {
         fprintf(stderr, "FATAL: RMVPE load\n"); return 1;
     }
 

@@ -104,9 +104,11 @@ typedef struct spcv_onnx_session {
  * @brief  Execution provider selection.
  */
 typedef enum {
-    SPCV_EP_AUTO     = 0,  /* try DML, fall back to CPU          */
-    SPCV_EP_DML      = 1,  /* DirectML (Windows D3D12 GPU)       */
-    SPCV_EP_CPU      = 2   /* CPU only                            */
+    SPCV_EP_AUTO     = 0,  /* best available GPU, else CPU       */
+    SPCV_EP_CUDA     = 1,  /* NVIDIA CUDA EP (works on TCC GPUs) */
+    SPCV_EP_DML      = 2,  /* DirectML (Windows D3D12 GPU)       */
+    SPCV_EP_VULKAN   = 3,  /* Vulkan EP (AMD / cross-vendor)     */
+    SPCV_EP_CPU      = 4   /* CPU only                            */
 } spcv_ep;
 
 /**
@@ -117,12 +119,15 @@ typedef enum {
 void spcv_onnx_set_ep(spcv_ep ep);
 
 /**
- * @brief  Set the DML GPU adapter index (0-based, call before spcv_onnx_load).
+ * @brief  Set the GPU device index (0-based, call before spcv_onnx_load).
  *
- * Passed to the DmlExecutionProvider as the "device_id" option. Ignored
- * when the CPU EP is used.
+ * Meaning depends on the EP:
+ *   - CUDA:   CUDA ordinal (nvidia-smi index; works on TCC / headless GPUs)
+ *   - DML:    DXGI adapter index
+ *   - Vulkan: Vulkan device index
+ * Ignored when the CPU EP is used.
  *
- * @param  id  DXGI adapter index (0 = first / primary GPU)
+ * @param  id  device index (0 = first / primary GPU)
  */
 void spcv_onnx_set_device_id(int id);
 
@@ -161,6 +166,10 @@ int spcv_onnx_load(const char *path, spcv_onnx_session **sess_out);
  * @return  SPCV_ONNX_OK or error code
  */
 int spcv_onnx_load_array(const void *data, size_t len, spcv_onnx_session **sess_out);
+
+/* Per-model EP selection (e.g. voice on GPU, HuBERT/RMVPE on CPU). */
+int  spcv_onnx_load_ep(const char *path, spcv_ep ep, spcv_onnx_session **sess_out);
+int  spcv_onnx_load_array_ep(const void *data, size_t len, spcv_ep ep, spcv_onnx_session **sess_out);
 
 /**
  * @brief  Free a session and its descriptors.

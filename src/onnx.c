@@ -266,23 +266,90 @@ void spcv_onnx_shutdown(void) {
 /*  Session load / free                                                */
 /* ------------------------------------------------------------------ */
 
-/* Apply the configured execution provider (DML + device_id) to opts.
- * Returns 0 on success (or benign fallback), -1 on hard failure. */
-static int apply_ep(const OrtApi *api, OrtSessionOptions *opts) {
-    if (g_ep != SPCV_EP_DML && g_ep != SPCV_EP_AUTO) return 0; /* CPU */
-    const char *keys[1]  = { "device_id" };
+/* Append one execution provider to opts. Returns 0 on success, -1 if the
+ * EP is unavailable (e.g. provider DLL missing / no compatible device). */
+static int append_ep(const OrtApi *api, OrtSessionOptions *opts,
+                     const char *ep_name, const char **keys, const char **vals,
+                     size_t n_keys) {
+    OrtStatus *s = api->SessionOptionsAppendExecutionProvider(
+        opts, ep_name, (const char *const *)keys, (const char *const *)vals, n_keys);
+    if (s) {
+        SPCV_TRACE("onnx", "%s EP unavailable: %s", ep_name, api->GetErrorMessage(s));
+        api->ReleaseStatus(s);
+        return -1;
+    }
+    SPCV_TRACE("onnx", "%s EP enabled (device_id=%d)", ep_name, g_device_id);
+    return 0;
+}
+
+/* Apply the configured execution provider to opts.
+ * Returns 0 on success (or benign fallback to CPU), -1 on hard failure. */
+static int apply_ep(const OrtApi *api, OrtSessionOptions *opts, spcv_ep ep) {
     char val[16];
     snprintf(val, sizeof(val), "%d", g_device_id);
-    const char *vals[1] = { val };
-    OrtStatus *s = api->SessionOptionsAppendExecutionProvider(
-        opts, "DmlExecutionProvider", keys, vals, 1);
-    if (s) {
-        SPCV_TRACE("onnx", "DML EP unavailable (device_id=%d), falling back to CPU", g_device_id);
-        api->ReleaseStatus(s);
-        if (g_ep == SPCV_EP_DML) return -1;
+
+    if (ep == SPCV_EP_CUDA) {
+        /* CUDA EP uses a dedicated API (not the generic name-based one). */
+        OrtCUDAProviderOptions copts;
+        memset(&copts, 0, sizeof(copts));
+        copts.device_id = g_device_id;
+        copts.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
+        copts.gpu_mem_limit = (size_t)-1;   /* SIZE_MAX: use all available */
+        copts.arena_extend_strategy = 1;    /* kSameAsRequested */
+        copts.do_copy_in_default_stream = 1;
+        copts.has_user_compute_stream = 0;
+        copts.default_memory_arena_cfg = NULL;
+        copts.tunable_op_enable = 0;
+        copts.tunable_op_tuning_enable = 0;
+        copts.tunable_op_max_tuning_duration_ms = 0;
+        OrtStatus *s = api->SessionOptionsAppendExecutionProvider_CUDA(opts, &copts);
+        if (s) {
+            SPCV_TRACE("onnx", "CUDA EP unavailable: %s", api->GetErrorMessage(s));
+            api->ReleaseStatus(s);
+            return -1;   /* hard requirement: user asked for CUDA */
+        }
+        SPCV_TRACE("onnx", "CUDA EP enabled (device_id=%d)", g_device_id);
         return 0;
     }
-    SPCV_TRACE("onnx", "DML EP enabled (device_id=%d)", g_device_id);
+    if (ep == SPCV_EP_DML) {
+        const char *keys[1] = { "device_id" };
+        const char *vals[1] = { val };
+        if (append_ep(api, opts, "DmlExecutionProvider", keys, vals, 1) != 0)
+            return -1;
+        return 0;
+    }
+    if (ep == SPCV_EP_VULKAN) {
+        const char *keys[1] = { "device_id" };
+        const char *vals[1] = { val };
+        if (append_ep(api, opts, "VulkanExecutionProvider", keys, vals, 1) != 0)
+            return -1;
+        return 0;
+    }
+    if (ep == SPCV_EP_AUTO) {
+        /* Try GPU EPs in order of preference; first one that loads wins.
+         * CUDA first (works on headless/TCC NVIDIA), then DML, then Vulkan. */
+        const char *keys[1] = { "device_id" };
+        const char *vals[1] = { val };
+        /* CUDA via dedicated API */
+        {
+            OrtCUDAProviderOptions copts;
+            memset(&copts, 0, sizeof(copts));
+            copts.device_id = g_device_id;
+            copts.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
+            copts.gpu_mem_limit = (size_t)-1;
+            copts.arena_extend_strategy = 1;
+            copts.do_copy_in_default_stream = 1;
+            OrtStatus *cs = api->SessionOptionsAppendExecutionProvider_CUDA(opts, &copts);
+            if (cs == NULL) return 0;
+            SPCV_TRACE("onnx", "AUTO: CUDA EP unavailable: %s", api->GetErrorMessage(cs));
+            api->ReleaseStatus(cs);
+        }
+        if (append_ep(api, opts, "DmlExecutionProvider",  keys, vals, 1) == 0) return 0;
+        if (append_ep(api, opts, "VulkanExecutionProvider", keys, vals, 1) == 0) return 0;
+        SPCV_TRACE("onnx", "AUTO: no GPU EP available, using CPU");
+        return 0;
+    }
+    /* SPCV_EP_CPU: nothing to append */
     return 0;
 }
 
@@ -342,7 +409,7 @@ int spcv_onnx_load(const char *path, spcv_onnx_session **sess_out) {
     OrtSessionOptions *opts = NULL;
     OrtStatus *s = api->CreateSessionOptions(&opts);
     if (s) { api->ReleaseStatus(s); return SPCV_ONNX_ERR_API; }
-    if (apply_ep(api, opts) != 0) { api->ReleaseSessionOptions(opts); return SPCV_ONNX_ERR_LOAD; }
+    if (apply_ep(api, opts, g_ep) != 0) { api->ReleaseSessionOptions(opts); return SPCV_ONNX_ERR_LOAD; }
 
     ORTCHAR_T wbuf[2048];
     const ORTCHAR_T *wpath = to_ortchar(path, wbuf, sizeof(wbuf)/sizeof(wbuf[0]));
@@ -369,7 +436,7 @@ int spcv_onnx_load_array(const void *data, size_t len, spcv_onnx_session **sess_
     OrtSessionOptions *opts = NULL;
     OrtStatus *s = api->CreateSessionOptions(&opts);
     if (s) { api->ReleaseStatus(s); return SPCV_ONNX_ERR_API; }
-    if (apply_ep(api, opts) != 0) { api->ReleaseSessionOptions(opts); return SPCV_ONNX_ERR_LOAD; }
+    if (apply_ep(api, opts, g_ep) != 0) { api->ReleaseSessionOptions(opts); return SPCV_ONNX_ERR_LOAD; }
 
     OrtSession *session = NULL;
     s = api->CreateSessionFromArray(g_ort_env, data, len, opts, &session);
@@ -379,6 +446,51 @@ int spcv_onnx_load_array(const void *data, size_t len, spcv_onnx_session **sess_
         SPCV_TRACE("onnx", "FAIL: CreateSessionFromArray: %s", msg ? msg : "(no msg)");
         api->ReleaseStatus(s);
         api->ReleaseSessionOptions(opts);
+        return SPCV_ONNX_ERR_LOAD;
+    }
+    return finish_session(api, session, opts, sess_out);
+}
+
+/* Load with an explicit EP (for per-model GPU/CPU selection). */
+int spcv_onnx_load_ep(const char *path, spcv_ep ep, spcv_onnx_session **sess_out) {
+    if (!path || !sess_out) return SPCV_ONNX_ERR_INPUT;
+    *sess_out = NULL;
+    const OrtApi *api = ort_api();
+    if (!api) return SPCV_ONNX_ERR_API;
+    SPCV_TRACE("onnx", "loading (ep=%d): %s", (int)ep, path);
+    OrtSessionOptions *opts = NULL;
+    OrtStatus *s = api->CreateSessionOptions(&opts);
+    if (s) { api->ReleaseStatus(s); return SPCV_ONNX_ERR_API; }
+    if (apply_ep(api, opts, ep) != 0) { api->ReleaseSessionOptions(opts); return SPCV_ONNX_ERR_LOAD; }
+    ORTCHAR_T wbuf[2048];
+    const ORTCHAR_T *wpath = to_ortchar(path, wbuf, sizeof(wbuf)/sizeof(wbuf[0]));
+    if (!wpath) { api->ReleaseSessionOptions(opts); return SPCV_ONNX_ERR_INPUT; }
+    OrtSession *session = NULL;
+    s = api->CreateSession(g_ort_env, wpath, opts, &session);
+    if (s) {
+        SPCV_TRACE("onnx", "FAIL: CreateSession: %s", api->GetErrorMessage(s));
+        api->ReleaseStatus(s); api->ReleaseSessionOptions(opts);
+        return SPCV_ONNX_ERR_LOAD;
+    }
+    return finish_session(api, session, opts, sess_out);
+}
+
+int spcv_onnx_load_array_ep(const void *data, size_t len, spcv_ep ep, spcv_onnx_session **sess_out) {
+    if (!data || len == 0 || !sess_out) return SPCV_ONNX_ERR_INPUT;
+    *sess_out = NULL;
+    const OrtApi *api = ort_api();
+    if (!api) return SPCV_ONNX_ERR_API;
+    SPCV_TRACE("onnx", "loading from memory (ep=%d): %zu bytes", (int)ep, len);
+    OrtSessionOptions *opts = NULL;
+    OrtStatus *s = api->CreateSessionOptions(&opts);
+    if (s) { api->ReleaseStatus(s); return SPCV_ONNX_ERR_API; }
+    if (apply_ep(api, opts, ep) != 0) { api->ReleaseSessionOptions(opts); return SPCV_ONNX_ERR_LOAD; }
+    OrtSession *session = NULL;
+    s = api->CreateSessionFromArray(g_ort_env, data, len, opts, &session);
+    if (s) {
+        const char *msg = api->GetErrorMessage(s);
+        SPCV_TRACE("onnx", "FAIL: CreateSessionFromArray: %s", msg ? msg : "(no msg)");
+        api->ReleaseStatus(s); api->ReleaseSessionOptions(opts);
         return SPCV_ONNX_ERR_LOAD;
     }
     return finish_session(api, session, opts, sess_out);
