@@ -50,6 +50,8 @@ static double spcv_t0 = 0.0, spcv_t_start = 0.0;
 
 /* from gpu_list.c */
 int spcv_list_gpus(void);
+/* from backends.c */
+int spcv_list_backends(void);
 
 /* ------------------------------------------------------------------ */
 /*  WAV I/O                                                            */
@@ -270,7 +272,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--aux-cpu")) aux_override = 1;
         else if (!strcmp(argv[i], "--aux-gpu")) aux_override = 0;
         else if (!strcmp(argv[i], "--gpu")) { if (++i < argc) {
-            if (!strcmp(argv[i], "list")) { spcv_list_gpus(); return 0; }
+            if (!strcmp(argv[i], "list")) { spcv_list_backends(); return 0; }
             gpu_id = atoi(argv[i]);
         }}
         else if (!strcmp(argv[i], "--voice-stdin")) voice_stdin = 1;
