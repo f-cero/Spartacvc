@@ -47,6 +47,8 @@ static double spcv_t0 = 0.0, spcv_t_start = 0.0;
 #include "debug.h"
 #include "rvc.h"
 #include "faiss_index.h"
+#include "pth2gguf.h"
+#include "gguf_check.h"
 
 /* from gpu_list.c */
 int spcv_list_gpus(void);
@@ -238,11 +240,15 @@ static unsigned char *read_all_stdin(size_t *out_len) {
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     const char *input = NULL, *voice_path = NULL, *hubert_path = NULL;
     const char *rmvpe_path = NULL;
     const char *output = NULL;
     const char *config_path = NULL;
     const char *index_path = NULL;
+    const char *to_gguf = NULL;    /* --to-gguf <out>: convert .pth -> GGUF and exit */
+    const char *check_gguf = NULL; /* --check-gguf <f>: verify a .gguf and exit */
     float index_rate = 0.05f;
     int pitch_st = 0;
     int pitch_from_config = 0;
@@ -275,6 +281,8 @@ int main(int argc, char **argv) {
             if (!strcmp(argv[i], "list")) { spcv_list_backends(); return 0; }
             gpu_id = atoi(argv[i]);
         }}
+        else if (!strcmp(argv[i], "--to-gguf")) { if (++i < argc) to_gguf = argv[i]; }
+        else if (!strcmp(argv[i], "--check-gguf")) { if (++i < argc) check_gguf = argv[i]; }
         else if (!strcmp(argv[i], "--voice-stdin")) voice_stdin = 1;
         else if (!strcmp(argv[i], "--debug")) debug = 1;
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -287,6 +295,8 @@ int main(int argc, char **argv) {
             printf("  --backend     cuda (NVIDIA) | dml (Windows GPU) | vulkan (AMD) | cpu | auto\n");
             printf("  --gpu <id>    device index (CUDA ordinal / DXGI adapter / Vulkan device)\n");
             printf("  --voice-stdin   read voice ONNX bytes from stdin (piped)\n");
+            printf("  --to-gguf <f>   convert .pth voice model to GGUF (for ggml runtime) and exit\n");
+            printf("  --check-gguf <f>  verify a converted .gguf (add --voice <v.pth> for value checks)\n");
             return 0;
         }
         else if (argv[i][0] != '-') { if (!input) input = argv[i]; }
@@ -323,6 +333,56 @@ int main(int argc, char **argv) {
         SPCV_TRACE("main", "config loaded: %s", config_path);
     }
 
+    /* ------------------------------------------------------------------ */
+    /*  Dedicated mode: .pth -> GGUF conversion (ggml runtime weights).    */
+    /*  spartacvc --voice model.pth --to-gguf model.gguf                   */
+    /*  No input WAV, no HuBERT/RMVPE, no ORT needed.                      */
+    /* ------------------------------------------------------------------ */
+    if (to_gguf) {
+        if (!voice_path || strlen(voice_path) < 5 ||
+            strcmp(voice_path + strlen(voice_path) - 4, ".pth") != 0) {
+            fprintf(stderr, "error: --to-gguf needs --voice <model.pth>\n");
+            return 1;
+        }
+        SPCV_TRACE("main", "converting .pth -> GGUF: %s", voice_path);
+        pth_model_t *pm = malloc(sizeof(pth_model_t)); /* heap: 1.4 MB, not stack */
+        if (pth_load(pm, voice_path) != 0) {
+            fprintf(stderr, "FATAL: .pth load: %s\n", voice_path); free(pm); return 1;
+        }
+        spcv_gguf_t gg;
+        if (spcv_pth2gguf(pm, &gg) != 0) {
+            fprintf(stderr, "FATAL: pth->gguf conversion\n");
+            pth_free(pm); free(pm); return 1;
+        }
+        if (!gguf_write_to_file(gg.ggctx, to_gguf, /*only_meta=*/false)) {
+            fprintf(stderr, "FATAL: gguf write: %s\n", to_gguf);
+            spcv_gguf_free(&gg); pth_free(pm); free(pm); return 1;
+        }
+        long long fsize = 0;
+        FILE *sz = fopen(to_gguf, "rb");
+        if (sz) { fseek(sz, 0, SEEK_END); fsize = ftell(sz); fclose(sz); }
+        printf("PASS: %s -> %s\n", voice_path, to_gguf);
+        printf("  gguf tensors: %lld\n", (long long)gguf_get_n_tensors(gg.ggctx));
+        printf("  gguf file:    %lld bytes\n", fsize);
+        {
+            int64_t k = gguf_find_key(gg.ggctx, "rvc.sample_rate");
+            if (k >= 0) printf("  sample_rate:  %u\n", (unsigned)gguf_get_val_u32(gg.ggctx, k));
+            else printf("  sample_rate:  (no embedded config; derive from tensors)\n");
+        }
+        spcv_gguf_free(&gg);
+        pth_free(pm); free(pm);
+        return 0;
+    }
+
+    /* Dedicated mode: verify a converted .gguf weight file.
+     * spartacvc --check-gguf model.gguf [--voice model.pth] */
+    if (check_gguf) {
+        int rc = spcv_gguf_check(check_gguf, voice_path);
+        if (rc == 0) printf("PASS: gguf check\n");
+        else printf("FAIL: gguf check (%d failures)\n", rc);
+        return rc == 0 ? 0 : 1;
+    }
+
     if (!rmvpe_path) rmvpe_path = "models/ozada/rmvpe.onnx";
 
     if (!input || (!voice_path && !voice_stdin) || !hubert_path) {
@@ -344,7 +404,7 @@ int main(int argc, char **argv) {
 
     /* 2. Load voice model — .pth (pure C), .onnx (ORT), or ONNX from stdin */
     int is_pth = (voice_path && strlen(voice_path) > 4 && strcmp(voice_path + strlen(voice_path) - 4, ".pth") == 0);
-    rvc_model_t rvc;
+    rvc_model_t *rvc = malloc(sizeof(rvc_model_t)); /* heap: 1.4 MB, not stack */
     spcv_onnx_session *voice = NULL;
     int model_sr = 0, model_fps = 0, model_dim = 0;
 
@@ -367,12 +427,12 @@ int main(int argc, char **argv) {
         SPCV_TRACE("main", "voice (stdin): sr=%d fps=%d dim=%d", model_sr, model_fps, model_dim);
     } else if (is_pth) {
         SPCV_TRACE("main", "loading .pth voice: %s", voice_path);
-        if (rvc_load(&rvc, voice_path) != 0) {
+        if (rvc_load(rvc, voice_path) != 0) {
             fprintf(stderr, "FATAL: .pth voice load\n"); return 1;
         }
-        model_sr = rvc.cfg.sr;
-        model_fps = rvc.fps;
-        model_dim = rvc.cfg.ques;
+        model_sr = rvc->cfg.sr;
+        model_fps = rvc->fps;
+        model_dim = rvc->cfg.ques;
         SPCV_TRACE("main", ".pth model: sr=%d fps=%d dim=%d", model_sr, model_fps, model_dim);
     } else {
         SPCV_TRACE("main", "loading .onnx voice: %s", voice_path);
@@ -539,7 +599,7 @@ int main(int argc, char **argv) {
         /* Pure C path */
         int out_len = 0;
         float *out_buf = malloc((size_t)t_model * 480 * sizeof(float));
-        if (rvc_infer(&rvc, emb_model, (int)t_model, pitch, f0_model,
+        if (rvc_infer(rvc, emb_model, (int)t_model, pitch, f0_model,
                       NULL, out_buf, &out_len, NULL) != 0) {
             fprintf(stderr, "FATAL: rvc_infer\n"); return 1;
         }
@@ -623,7 +683,8 @@ int main(int argc, char **argv) {
     free(emb_model);
     free(pitch);
     free(f0_model);
-    rvc_free(&rvc);
+    rvc_free(rvc);
+    free(rvc);
     spcv_onnx_free(hub);
     spcv_onnx_free(rmvpe);
     spcv_onnx_shutdown();
