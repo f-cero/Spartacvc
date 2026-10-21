@@ -32,8 +32,9 @@ struct spcv_ggml {
     struct gguf_context *gguf;   // for name/shape lookup
     int be_id;                 // 0=cpu, 1=cuda
     // current forward pass
-    struct ggml_context *ctx;    // compute context
+    struct ggml_context *ctx;    // compute context (current)
     struct ggml_cgraph *gf;      // compute graph
+    struct ggml_context *oldctx; // previous compute context (free after sched_reset)
     input_t inputs[SPCV_MAX_INPUTS];
     int n_inputs;
 };
@@ -123,7 +124,9 @@ struct ggml_tensor * spcv_ggml_tensor(const spcv_ggml_t *g, const char *name) {
 /** Create a fresh compute context + graph for one forward pass. */
 struct ggml_context * spcv_ggml_ctx(spcv_ggml_t *g) {
     if (!g) return NULL;
-    if (g->ctx) { ggml_free(g->ctx); g->ctx = NULL; }
+    // The previous compute context is kept alive until spcv_ggml_compute()
+    // calls sched_reset (which releases the scheduler's reference to it).
+    // We do NOT free it here — that would be a use-after-free.
     g->n_inputs = 0;
     struct ggml_init_params ip = { (size_t)SPCV_CTX_META_MB * 1024 * 1024, NULL, /*no_alloc=*/true };
     g->ctx = ggml_init(ip);
@@ -144,6 +147,10 @@ enum ggml_status spcv_ggml_compute(spcv_ggml_t *g, struct ggml_tensor *out,
                                    void *dst, size_t nbytes) {
     if (!g || !g->ctx || !g->gf) return GGML_STATUS_FAILED;
     ggml_build_forward_expand(g->gf, out);
+    // Reset the scheduler (releases the previous graph's allocation),
+    // then free the previous compute context (now safe to free).
+    ggml_backend_sched_reset(g->sched);
+    if (g->oldctx) { ggml_free(g->oldctx); g->oldctx = NULL; }
     if (!ggml_backend_sched_alloc_graph(g->sched, g->gf)) return GGML_STATUS_FAILED;
     // Upload registered inputs (now allocated).
     for (int i = 0; i < g->n_inputs; i++) {
@@ -154,8 +161,9 @@ enum ggml_status spcv_ggml_compute(spcv_ggml_t *g, struct ggml_tensor *out,
     enum ggml_status st = ggml_backend_sched_graph_compute(g->sched, g->gf);
     if (st != GGML_STATUS_SUCCESS) return st;
     if (dst) ggml_backend_tensor_get(out, dst, 0, nbytes);
-    // Tear down the forward-pass context.
-    ggml_free(g->ctx); g->ctx = NULL; g->gf = NULL; g->n_inputs = 0;
+    // Keep the compute context alive (the scheduler still references it).
+    // It will be freed by the next spcv_ggml_compute() or spcv_ggml_free().
+    g->oldctx = g->ctx; g->ctx = NULL; g->gf = NULL; g->n_inputs = 0;
     return GGML_STATUS_SUCCESS;
 }
 
@@ -167,6 +175,7 @@ int spcv_ggml_backend_id(const spcv_ggml_t *g) { return g ? g->be_id : -1; }
 void spcv_ggml_free(spcv_ggml_t *g) {
     if (!g) return;
     if (g->ctx) ggml_free(g->ctx);
+    if (g->oldctx) ggml_free(g->oldctx);
     if (g->sched) ggml_backend_sched_free(g->sched);
     if (g->wbuf) ggml_backend_buffer_free(g->wbuf);
     if (g->cpu) ggml_backend_free(g->cpu);
