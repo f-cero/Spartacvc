@@ -31,6 +31,7 @@ struct spcv_ggml {
     struct ggml_context *wctx;   // weights
     struct gguf_context *gguf;   // for name/shape lookup
     int be_id;                 // 0=cpu, 1=cuda
+    char gguf_path[512];       // path to the .gguf file (for CPU re-read)
     // current forward pass
     struct ggml_context *ctx;    // compute context (current)
     struct ggml_cgraph *gf;      // compute graph
@@ -43,6 +44,7 @@ struct spcv_ggml {
 spcv_ggml_t * spcv_ggml_load(const char *path, int be, int dev) {
     spcv_ggml_t *g = (spcv_ggml_t *)calloc(1, sizeof(*g));
     if (!g) return NULL;
+    strncpy(g->gguf_path, path, sizeof(g->gguf_path) - 1);
 
     // 1. Metadata context (no_alloc=true: tensors created, no data yet).
     struct gguf_init_params gp = { /*no_alloc=*/true, &g->wctx };
@@ -171,6 +173,7 @@ int spcv_ggml_n_tensors(const spcv_ggml_t *g) {
     return g ? (int)gguf_get_n_tensors(g->gguf) : 0;
 }
 int spcv_ggml_backend_id(const spcv_ggml_t *g) { return g ? g->be_id : -1; }
+const char * spcv_ggml_gguf_path(const spcv_ggml_t *g) { return g ? g->gguf_path : NULL; }
 
 void spcv_ggml_free(spcv_ggml_t *g) {
     if (!g) return;

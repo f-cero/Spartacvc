@@ -85,6 +85,9 @@ int spcv_ggml_n_tensors(const spcv_ggml_t *g);
 /** Which backend is active: 0=cpu, 1=cuda. */
 int spcv_ggml_backend_id(const spcv_ggml_t *g);
 
+/** Get the GGUF file path (for CPU re-read of weights). */
+const char * spcv_ggml_gguf_path(const spcv_ggml_t *g);
+
 /** Free the handle and all backends/contexts. */
 void spcv_ggml_free(spcv_ggml_t *g);
 
