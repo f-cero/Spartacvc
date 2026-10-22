@@ -49,6 +49,7 @@ static double spcv_t0 = 0.0, spcv_t_start = 0.0;
 #include "faiss_index.h"
 #include "pth2gguf.h"
 #include "gguf_check.h"
+#include "ggml_pipeline.h"
 
 /* from gpu_list.c */
 int spcv_list_gpus(void);
@@ -249,6 +250,7 @@ int main(int argc, char **argv) {
     const char *index_path = NULL;
     const char *to_gguf = NULL;    /* --to-gguf <out>: convert .pth -> GGUF and exit */
     const char *check_gguf = NULL; /* --check-gguf <f>: verify a .gguf and exit */
+    const char *gguf_path = NULL;  /* --gguf <f>: run ggml pipeline with this GGUF */
     float index_rate = 0.05f;
     int pitch_st = 0;
     int pitch_from_config = 0;
@@ -283,6 +285,7 @@ int main(int argc, char **argv) {
         }}
         else if (!strcmp(argv[i], "--to-gguf")) { if (++i < argc) to_gguf = argv[i]; }
         else if (!strcmp(argv[i], "--check-gguf")) { if (++i < argc) check_gguf = argv[i]; }
+        else if (!strcmp(argv[i], "--gguf")) { if (++i < argc) gguf_path = argv[i]; }
         else if (!strcmp(argv[i], "--voice-stdin")) voice_stdin = 1;
         else if (!strcmp(argv[i], "--debug")) debug = 1;
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -600,6 +603,23 @@ int main(int argc, char **argv) {
             }
             fprintf(stderr, "[dump] emb_model T=%lld dim=%d, pitch, f0_model, emb_g -> scratch/\n", (long long)t_model, emb_dim);
         }
+        if (gguf_path) {
+            /* GGML path (GPU compute) */
+            int ggml_be = (main_ep == SPCV_EP_CUDA) ? 1 : 0;
+            int out_len = 0;
+            float *out_buf = malloc((size_t)t_model * 480 * sizeof(float));
+            fprintf(stderr, "[ggml] running pipeline (be=%d gpu=%d)\n", ggml_be, gpu_id);
+            if (spcv_ggml_infer(gguf_path, ggml_be, gpu_id,
+                                emb_model, emb_dim, (int)t_model,
+                                pitch, f0_model, out_buf, &out_len) != 0) {
+                fprintf(stderr, "FATAL: ggml_infer\n"); return 1;
+            }
+            pcm = out_buf;
+            out_n = out_len;
+            SPCV_MARK("GGML enc+flow+dec");
+            SPCV_TRACE("main", "ggml output: %lld samples @ %d Hz",
+                       (long long)out_n, model_sr);
+        } else {
         /* Pure C path */
         int out_len = 0;
         float *out_buf = malloc((size_t)t_model * 480 * sizeof(float));
@@ -612,6 +632,7 @@ int main(int argc, char **argv) {
         SPCV_MARK("RVC enc+flow+dec");
         SPCV_TRACE("main", "rvc output: %lld samples @ %d Hz",
                    (long long)out_n, model_sr);
+        }
     } else {
         /* ONNX path */
         int64_t phone_lengths = t_model;
