@@ -122,3 +122,11 @@ target_include_directories(test_enc_min2 PRIVATE "${GGML_SRC}/include" "${SPCV}"
 add_executable(gen_ref gen_ref.c "${SPCV}/rvc_infer.c" "${SPCV}/rvc.c" "${SPCV}/pth_loader.c" "${SPCV}/zip_reader.c" "${SPCV}/pickle.c" "${SPCV}/threads.c")
 target_link_libraries(gen_ref PRIVATE ggml ggml-cpu)
 target_include_directories(gen_ref PRIVATE "${GGML_SRC}/include" "${SPCV}")
+
+add_executable(test_rvc_flow_gpu test_rvc_flow_gpu.c "${SPCV}/gguf_load.c")
+target_link_libraries(test_rvc_flow_gpu PRIVATE ggml ggml-cpu ggml-cuda)
+target_include_directories(test_rvc_flow_gpu PRIVATE "${GGML_SRC}/include" "${SPCV}")
+
+add_executable(gen_flow_ref gen_flow_ref.c "${SPCV}/rvc_infer.c" "${SPCV}/rvc.c" "${SPCV}/pth_loader.c" "${SPCV}/zip_reader.c" "${SPCV}/pickle.c" "${SPCV}/threads.c")
+target_link_libraries(gen_flow_ref PRIVATE ggml ggml-cpu)
+target_include_directories(gen_flow_ref PRIVATE "${GGML_SRC}/include" "${SPCV}")
