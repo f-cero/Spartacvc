@@ -134,3 +134,7 @@ target_include_directories(gen_flow_ref PRIVATE "${GGML_SRC}/include" "${SPCV}")
 add_executable(test_rvc_dec_gpu test_rvc_dec_gpu.c "${SPCV}/gguf_load.c")
 target_link_libraries(test_rvc_dec_gpu PRIVATE ggml ggml-cpu ggml-cuda)
 target_include_directories(test_rvc_dec_gpu PRIVATE "${GGML_SRC}/include" "${SPCV}")
+
+add_executable(test_e2e_gpu test_e2e_gpu.c "${SPCV}/gguf_load.c")
+target_link_libraries(test_e2e_gpu PRIVATE ggml ggml-cpu ggml-cuda)
+target_include_directories(test_e2e_gpu PRIVATE "${GGML_SRC}/include" "${SPCV}")

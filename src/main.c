@@ -594,7 +594,11 @@ int main(int argc, char **argv) {
             if (pf) { fwrite(pitch, sizeof(int64_t), (size_t)t_model, pf); fclose(pf); }
             FILE *ff = fopen("scratch/f0_model.bin", "wb");
             if (ff) { fwrite(f0_model, sizeof(float), (size_t)t_model, ff); fclose(ff); }
-            fprintf(stderr, "[dump] emb_model T=%lld dim=%d, pitch, f0_model -> scratch/\n", (long long)t_model, emb_dim);
+            if (rvc->emb_g) {
+                FILE *gf = fopen("scratch/emb_g.bin", "wb");
+                if (gf) { fwrite(rvc->emb_g, sizeof(float), (size_t)rvc->emb_g_dim, gf); fclose(gf); }
+            }
+            fprintf(stderr, "[dump] emb_model T=%lld dim=%d, pitch, f0_model, emb_g -> scratch/\n", (long long)t_model, emb_dim);
         }
         /* Pure C path */
         int out_len = 0;
