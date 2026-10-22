@@ -448,6 +448,24 @@ static int encoder_forward(const rvc_model_t *m,
     return 0;
 }
 
+/**
+ * @brief  Public wrapper for the encoder forward (for testing / ggml comparison).
+ *         Computes m_p[FC,T] and logs_p[FC,T] from phone[T,ques] + pitch[T].
+ * @param  m        loaded RVC model (weights + config).
+ * @param  phone    phone embeddings [T, ques] (row-major, time-major).
+ * @param  T        sequence length.
+ * @param  pitch    pitch indices [T] (int64, clamped to [0,255]).
+ * @param  m_p      output mean [FC, T] (C-major).
+ * @param  logs_p   output log-std [FC, T] (C-major).
+ * @return 0 on success.
+ */
+int rvc_encoder_forward(const rvc_model_t *m,
+                        const float *phone, int T,
+                        const int64_t *pitch,
+                        float *m_p, float *logs_p) {
+    return encoder_forward(m, phone, T, pitch, m_p, logs_p);
+}
+
 /* ================================================================== */
 /* Flow: 4× ResidualCouplingLayer (reverse order)                     */
 /* ================================================================== */
@@ -685,6 +703,7 @@ static int decoder_forward(const rvc_model_t *m,
         free(d);
         d = d2;
         cur_C = nC; cur_L = nL;
+        if (getenv("SPCV_DEBUG")) { double rms=0; for(int i=0;i<cur_C*cur_L;i++) rms+=d[i]*d[i]; fprintf(stderr,"[dec] stage %d upsample RMS=%.6f C=%d L=%d\n", u, sqrt(rms/(cur_C*cur_L)), cur_C, cur_L); }
 
         /* noise_conv: Conv1d(1→nC, K, stride) on har_source */
         if (m->noise_w[u]) {
@@ -700,6 +719,7 @@ static int decoder_forward(const rvc_model_t *m,
             noise_conv(ns, har_source, m->noise_w[u], m->noise_b[u], nC, nL, nK, stride, OL);
             for (int i = 0; i < nC * nL; i++) d[i] += ns[i];
             free(ns);
+            if (getenv("SPCV_DEBUG")) { double rms=0; for(int i=0;i<cur_C*cur_L;i++) rms+=d[i]*d[i]; fprintf(stderr,"[dec] stage %d noise_conv RMS=%.6f\n", u, sqrt(rms/(cur_C*cur_L))); }
         }
 
         /* ResBlocks (averaged) */
@@ -719,6 +739,7 @@ static int decoder_forward(const rvc_model_t *m,
             free(d3);
         }
         for (int i = 0; i < cur_C * cur_L; i++) sum[i] /= NK;
+        if (getenv("SPCV_DEBUG")) { double rms=0; for(int i=0;i<cur_C*cur_L;i++) rms+=sum[i]*sum[i]; fprintf(stderr,"[dec] stage %d resblocks RMS=%.6f\n", u, sqrt(rms/(cur_C*cur_L))); }
         free(d);
         d = sum;
         if (getenv("SPCV_DEBUG")) fprintf(stderr, "[dec] stage u=%d done (C=%d L=%d)\n", u, cur_C, cur_L);

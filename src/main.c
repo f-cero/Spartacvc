@@ -604,19 +604,30 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[dump] emb_model T=%lld dim=%d, pitch, f0_model, emb_g -> scratch/\n", (long long)t_model, emb_dim);
         }
         if (gguf_path) {
-            /* GGML path (GPU compute) */
+            /* GGML path: pure-C encoder + ggml flow+decoder on GPU */
             int ggml_be = (main_ep == SPCV_EP_CUDA) ? 1 : 0;
+            fprintf(stderr, "[ggml] encoder (CPU) + flow+dec (be=%d gpu=%d)\n", ggml_be, gpu_id);
+            /* Run encoder on CPU */
+            int FC = rvc->cfg.p_dim;
+            float *m_p = malloc((size_t)FC * t_model * sizeof(float));
+            float *logs_p = malloc((size_t)FC * t_model * sizeof(float));
+            if (rvc_encoder_forward(rvc, emb_model, (int)t_model, pitch, m_p, logs_p) != 0) {
+                fprintf(stderr, "FATAL: encoder\n"); return 1;
+            }
+            SPCV_MARK("encoder (CPU)");
+            /* Run flow+decoder on GPU */
             int out_len = 0;
             float *out_buf = malloc((size_t)t_model * 480 * sizeof(float));
-            fprintf(stderr, "[ggml] running pipeline (be=%d gpu=%d)\n", ggml_be, gpu_id);
-            if (spcv_ggml_infer(gguf_path, ggml_be, gpu_id,
-                                emb_model, emb_dim, (int)t_model,
-                                pitch, f0_model, out_buf, &out_len) != 0) {
-                fprintf(stderr, "FATAL: ggml_infer\n"); return 1;
+            if (spcv_ggml_flow_dec(gguf_path, ggml_be, gpu_id,
+                                   m_p, logs_p, rvc->emb_g, (int)t_model,
+                                   f0_model,
+                                   out_buf, &out_len) != 0) {
+                fprintf(stderr, "FATAL: ggml_flow_dec\n"); return 1;
             }
+            free(m_p); free(logs_p);
             pcm = out_buf;
             out_n = out_len;
-            SPCV_MARK("GGML enc+flow+dec");
+            SPCV_MARK("GGML flow+dec");
             SPCV_TRACE("main", "ggml output: %lld samples @ %d Hz",
                        (long long)out_n, model_sr);
         } else {

@@ -123,6 +123,30 @@ struct ggml_tensor * spcv_ggml_tensor(const spcv_ggml_t *g, const char *name) {
     return ggml_get_tensor(g->wctx, name);
 }
 
+/** Read a tensor's raw data from the GGUF file into a host buffer.
+ *  @return 0 on success, -1 if tensor not found or read failed. */
+int spcv_ggml_get_tensor(const spcv_ggml_t *g, const char *name,
+                         void *dst, size_t nbytes, int64_t *out_n) {
+    if (!g || !g->gguf) return -1;
+    int64_t tid = gguf_find_tensor(g->gguf, name);
+    if (tid < 0) return -1;
+    if (out_n) {
+        const int64_t *ne = gguf_get_tensor_ne(g->gguf, tid);
+        int64_t n = 1;
+        for (int i = 0; i < GGML_MAX_DIMS; i++) n *= ne[i];
+        *out_n = n;
+    }
+    FILE *fp = fopen(g->gguf_path, "rb");
+    if (!fp) return -1;
+    size_t data_off = gguf_get_data_offset(g->gguf);
+    size_t off = gguf_get_tensor_offset(g->gguf, tid);
+    int rc = -1;
+    if (fseek(fp, (long)(data_off + off), SEEK_SET) == 0 &&
+        fread(dst, 1, nbytes, fp) == nbytes) rc = 0;
+    fclose(fp);
+    return rc;
+}
+
 /** Create a fresh compute context + graph for one forward pass. */
 struct ggml_context * spcv_ggml_ctx(spcv_ggml_t *g) {
     if (!g) return NULL;

@@ -79,6 +79,11 @@ void spcv_ggml_set_input(spcv_ggml_t *g, const char *name, const void *data, siz
 enum ggml_status spcv_ggml_compute(spcv_ggml_t *g, struct ggml_tensor *out,
                                    void *dst, size_t nbytes);
 
+/** Read a tensor's raw data from the GGUF file into a host buffer.
+ *  @return 0 on success, -1 if tensor not found or read failed. */
+int spcv_ggml_get_tensor(const spcv_ggml_t *g, const char *name,
+                         void *dst, size_t nbytes, int64_t *out_n);
+
 /** Number of weight tensors (for diagnostics). */
 int spcv_ggml_n_tensors(const spcv_ggml_t *g);
 

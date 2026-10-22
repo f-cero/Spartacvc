@@ -32,6 +32,26 @@ int spcv_ggml_infer(const char *gguf_path, int be_id, int gpu_id,
                     const int64_t *pitch, const float *f0,
                     float *out, int *out_len);
 
+/**
+ * @brief  Run flow+decoder via ggml (encoder output provided externally).
+ *
+ * @param  gguf_path  path to the .gguf voice model
+ * @param  be_id      0=CPU, 1=CUDA, 2=Vulkan
+ * @param  gpu_id     device index
+ * @param  m_p        encoder mean [192, T] C-fast
+ * @param  logs_p     encoder log-sigma [192, T] C-fast
+ * @param  g_emb      speaker embedding [256]
+ * @param  T          number of frames
+ * @param  out        [out] output PCM (caller allocates T*480 floats)
+ * @param  out_len    [out] number of output samples
+ * @return 0 on success, -1 on failure
+ */
+int spcv_ggml_flow_dec(const char *gguf_path, int be_id, int gpu_id,
+                       const float *m_p, const float *logs_p,
+                       const float *g_emb, int T,
+                       const float *f0,   /* f0 [T] Hz, for SineGen */
+                       float *out, int *out_len);
+
 #ifdef __cplusplus
 }
 #endif
