@@ -1,15 +1,16 @@
-// pth2gguf.c — in-app, in-memory .pth → GGUF conversion.
+// pth2gguf.c — in-app, in-memory .pth → GGUF conversion (parallelized).
 // See pth2gguf.h for the contract. Spec: tools/pth-to-gguf.md.
 //
-// Pipeline per tensor:
-//   1. normalize name (strip wrapper prefixes)
-//   2. if weight-norm pair: fuse  W[i,...] = V[i,...] * G[i] / ||V[i,...]||
-//   3. reverse dims (PyTorch [d0..dn] -> ggml ne [dn..d0]); flat byte copy
-//   4. add to ggml context + gguf tensor table
+// Pipeline:
+//   1. normalize names, classify weight-norm pairs
+//   2. serial: create ggml tensors (fast pointer-bump allocation)
+//   3. PARALLEL: fill tensor data (I/O from .pth + dtype convert + weight-norm fusion)
+//   4. serial: register in gguf table
 //
 // All math in float32. weight-norm fused in PyTorch layout, then reversed.
 
 #include "pth2gguf.h"
+#include "threads.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,8 +22,6 @@
 // name normalization
 // ---------------------------------------------------------------------------
 
-// Strip leading wrapper prefixes (module., model., net_g., synthesizer.,
-// generator.) repeatedly. Operates in place. (spec 1.2)
 static void strip_prefixes(char *name) {
     static const char *prefixes[] = {
         "module.", "model.", "net_g.", "synthesizer.", "generator."
@@ -41,7 +40,7 @@ static void strip_prefixes(char *name) {
 }
 
 // ---------------------------------------------------------------------------
-// small helpers
+// helpers
 // ---------------------------------------------------------------------------
 
 static int64_t t_n_elem(const pth_tensor_t *t) {
@@ -50,39 +49,14 @@ static int64_t t_n_elem(const pth_tensor_t *t) {
     return n;
 }
 
-// Create a ggml tensor in gctx with reversed dims, copy flat f32 data,
-// register it in the gguf tensor table. (spec 2: reverse dims, copy flat)
-static struct ggml_tensor * add_tensor(
-        struct ggml_context * gctx,
-        struct gguf_context * ggctx,
-        const char *name,
-        const pth_tensor_t *t,
-        const float *data)
-{
-    int64_t ne[4] = { 1, 1, 1, 1 };
-    int nd = t->ndim > 4 ? 4 : t->ndim;
-    for (int i = 0; i < nd; i++) ne[i] = t->shape[t->ndim - 1 - i];
-
-    struct ggml_tensor * gt = ggml_new_tensor(gctx, GGML_TYPE_F32, nd, ne);
-    if (!gt) return NULL;
-    ggml_set_name(gt, name);
-    memcpy(gt->data, data, (size_t)t_n_elem(t) * sizeof(float));
-    gguf_add_tensor(ggctx, gt);
-    return gt;
-}
-
 // ---------------------------------------------------------------------------
 // weight-norm fusion (spec 5.2)
 // ---------------------------------------------------------------------------
 
-// Fuse V (weight_v) and G (weight_g) into W = V * (G / ||V||) along dim 0.
-// Both inputs in PyTorch layout (before reversal). Returns malloc'd f32.
-static float * fuse_weight_norm(const pth_tensor_t *tv, const float *V,
-                                const float *G) {
+static void fuse_weight_norm_into(float *W, const pth_tensor_t *tv,
+                                  const float *V, const float *G) {
     int64_t d0 = tv->shape[0];
     int64_t rest = t_n_elem(tv) / d0;
-    float *W = (float *)malloc((size_t)t_n_elem(tv) * sizeof(float));
-    if (!W) return NULL;
     for (int64_t i = 0; i < d0; i++) {
         double ss = 0.0;
         for (int64_t j = 0; j < rest; j++) { double v = V[i*rest+j]; ss += v*v; }
@@ -90,7 +64,53 @@ static float * fuse_weight_norm(const pth_tensor_t *tv, const float *V,
         float scale = (norm == 0.0f) ? 0.0f : G[i] / norm;
         for (int64_t j = 0; j < rest; j++) W[i*rest+j] = V[i*rest+j] * scale;
     }
-    return W;
+}
+
+// ---------------------------------------------------------------------------
+// parallel worker context
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    const pth_model_t *m;
+    // output: ggml tensor data pointers (pre-allocated)
+    float *dst[PK_MAX_TENSORS];
+    // tensor indices to process (regular + fused)
+    int    idx[PK_MAX_TENSORS];
+    int    n_items;
+    // for fused: the _g tensor index (-1 for regular)
+    int    g_idx[PK_MAX_TENSORS];
+    // kind: 0=regular, 2=fused
+    int    kind[PK_MAX_TENSORS];
+} par_ctx_t;
+
+static void fill_worker(int begin, int end, void *ctx_) {
+    par_ctx_t *ctx = (par_ctx_t *)ctx_;
+    const pth_model_t *m = ctx->m;
+    for (int i = begin; i < end; i++) {
+        int ti = ctx->idx[i];
+        float *dst = ctx->dst[i];
+        const pth_tensor_t *t = &m->pkl.tensors[ti];
+        int64_t n = t_n_elem(t);
+
+        if (ctx->kind[i] == 0) {
+            // regular: just read + convert
+            if (pth_read_tensor_f32(m, t, dst) != 0) {
+                fprintf(stderr, "[pth2gguf] thread: read failed for tensor %d\n", ti);
+                return;
+            }
+        } else {
+            // fused: read V and G, then fuse into dst
+            int gi = ctx->g_idx[i];
+            const pth_tensor_t *tg = &m->pkl.tensors[gi];
+            float *V = (float *)malloc((size_t)n * sizeof(float));
+            float *G = (float *)malloc((size_t)t_n_elem(tg) * sizeof(float));
+            if (!V || !G) { free(V); free(G); return; }
+            if (pth_read_tensor_f32(m, t, V) != 0) { free(V); free(G); return; }
+            if (pth_read_tensor_f32(m, tg, G) != 0) { free(V); free(G); return; }
+            fuse_weight_norm_into(dst, t, V, G);
+            free(V); free(G);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +149,7 @@ int spcv_pth2gguf(const pth_model_t *m, spcv_gguf_t *out) {
     int n = pkl->n_tensors;
     if (n <= 0) { fprintf(stderr, "[pth2gguf] no tensors\n"); return -1; }
 
-    // Size the ggml memory pool: all tensor data + per-tensor struct overhead.
+    // Size the ggml memory pool.
     size_t total = 0;
     for (int i = 0; i < n; i++)
         total += (size_t)t_n_elem(&pkl->tensors[i]) * sizeof(float);
@@ -144,10 +164,9 @@ int spcv_pth2gguf(const pth_model_t *m, spcv_gguf_t *out) {
 
     set_metadata(gg, m);
 
-    // Pass 1: normalize names + classify weight-norm parts.
-    // (fixed-size arrays: MSVC has no VLAs; PK_MAX_TENSORS bounds n)
+    // Pass 1: normalize names + classify.
     char names[PK_MAX_TENSORS][MAX_NAME];
-    int  kind[PK_MAX_TENSORS];        // 0=regular, 1=weight_g, 2=weight_v
+    int  kind[PK_MAX_TENSORS];
     char base[PK_MAX_TENSORS][MAX_NAME];
     for (int i = 0; i < n; i++) {
         const pth_tensor_t *t = &pkl->tensors[i];
@@ -166,49 +185,67 @@ int spcv_pth2gguf(const pth_model_t *m, spcv_gguf_t *out) {
         }
     }
 
-    // Pass 2: emit regular tensors.
-    int n_regular = 0, n_fused = 0;
+    // Build work list: regular tensors + fused pairs (skip _g and _v originals).
+    par_ctx_t pc;
+    memset(&pc, 0, sizeof(pc));
+    pc.m = m;
+    pc.n_items = 0;
+
+    // Regular tensors
     for (int i = 0; i < n; i++) {
         if (kind[i] != 0) continue;
-        const pth_tensor_t *t = &pkl->tensors[i];
-        float *buf = (float *)malloc((size_t)t_n_elem(t) * sizeof(float));
-        if (!buf) goto fail;
-        if (pth_read_tensor_f32(m, t, buf) != 0) { free(buf); goto fail; }
-        if (!add_tensor(gctx, gg, names[i], t, buf)) { free(buf); goto fail; }
-        free(buf);
-        n_regular++;
+        pc.idx[pc.n_items] = i;
+        pc.kind[pc.n_items] = 0;
+        pc.g_idx[pc.n_items] = -1;
+        pc.n_items++;
     }
-
-    // Pass 3: emit fused weight-norm tensors (base.weight).
+    // Fused pairs (iterate _v side)
     for (int i = 0; i < n; i++) {
-        if (kind[i] != 2) continue;                 // iterate the _v side
-        // find matching _g for the same base
+        if (kind[i] != 2) continue;
         int g = -1;
         for (int j = 0; j < n; j++)
             if (kind[j] == 1 && strcmp(base[j], base[i]) == 0) { g = j; break; }
-        if (g < 0) { fprintf(stderr, "[pth2gguf] weight_v without weight_g: %s\n", base[i]); continue; }
-
-        const pth_tensor_t *tv = &pkl->tensors[i];
-        const pth_tensor_t *tg = &pkl->tensors[g];
-        float *V = (float *)malloc((size_t)t_n_elem(tv) * sizeof(float));
-        float *G = (float *)malloc((size_t)t_n_elem(tg) * sizeof(float));
-        if (!V || !G) { free(V); free(G); goto fail; }
-        if (pth_read_tensor_f32(m, tv, V) != 0) { free(V); free(G); goto fail; }
-        if (pth_read_tensor_f32(m, tg, G) != 0) { free(V); free(G); goto fail; }
-
-        float *W = fuse_weight_norm(tv, V, G);
-        free(V); free(G);
-        if (!W) goto fail;
-
-        char out_name[MAX_NAME];
-        snprintf(out_name, MAX_NAME, "%s.weight", base[i]);
-        if (!add_tensor(gctx, gg, out_name, tv, W)) { free(W); goto fail; }
-        free(W);
-        n_fused++;
+        if (g < 0) continue;
+        pc.idx[pc.n_items] = i;
+        pc.kind[pc.n_items] = 2;
+        pc.g_idx[pc.n_items] = g;
+        pc.n_items++;
     }
 
-    fprintf(stderr, "[pth2gguf] converted %d tensors (%d regular, %d fused)\n",
-            n_regular + n_fused, n_regular, n_fused);
+    // Pass 2 (serial): create ggml tensors, collect output pointers.
+    struct ggml_tensor *gt_list[PK_MAX_TENSORS];
+    int n_regular = 0, n_fused = 0;
+    for (int i = 0; i < pc.n_items; i++) {
+        int ti = pc.idx[i];
+        const pth_tensor_t *t = &pkl->tensors[ti];
+        int64_t ne[4] = { 1, 1, 1, 1 };
+        int nd = t->ndim > 4 ? 4 : t->ndim;
+        for (int d = 0; d < nd; d++) ne[d] = t->shape[t->ndim - 1 - d];
+
+        char out_name[MAX_NAME];
+        if (pc.kind[i] == 2)
+            snprintf(out_name, MAX_NAME, "%s.weight", base[ti]);
+        else
+            snprintf(out_name, MAX_NAME, "%s", names[ti]);
+
+        struct ggml_tensor *gt = ggml_new_tensor(gctx, GGML_TYPE_F32, nd, ne);
+        if (!gt) goto fail;
+        ggml_set_name(gt, out_name);
+        gt_list[i] = gt;
+        pc.dst[i] = (float *)gt->data;
+
+        if (pc.kind[i] == 2) n_fused++; else n_regular++;
+    }
+
+    // Pass 3 (PARALLEL): fill tensor data.
+    spcv_par_for(pc.n_items, fill_worker, &pc);
+
+    // Pass 4 (serial): register in gguf table.
+    for (int i = 0; i < pc.n_items; i++)
+        gguf_add_tensor(gg, gt_list[i]);
+
+    fprintf(stderr, "[pth2gguf] converted %d tensors (%d regular, %d fused) [%d threads]\n",
+            n_regular + n_fused, n_regular, n_fused, spcv_nthreads());
     out->gctx = gctx;
     out->ggctx = gg;
     return 0;
