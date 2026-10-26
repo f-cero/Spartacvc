@@ -12,10 +12,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <ggml.h>
 #include <ggml-cpu.h>
 #include <ggml-cuda.h>
 #include <ggml-alloc.h>
+
+/* 10-second timeout guard: call TMO_CHECK(label) after each major op */
+static double tmo_start = 0;
+#define TMO_BEGIN() do { tmo_start = (double)clock()/CLOCKS_PER_SEC; } while(0)
+#define TMO_CHECK(label) do { double dt = (double)clock()/CLOCKS_PER_SEC - tmo_start; \
+    if (dt > 10.0) { fprintf(stderr, "[TIMEOUT] %s took %.1fs (>10s) — ABORT\n", label, dt); exit(99); } \
+    else if (dt > 1.0) fprintf(stderr, "[tmo] %s: %.2fs\n", label, dt); } while(0)
 
 #define FC_DIM  192
 #define UP_DIM  512
@@ -193,10 +201,12 @@ static int ggml_flow(spcv_ggml_t *g, const float *m_p, const float *logs_p,
         int idx = flow_idx[fi];
         char nm[256], bn[256];
         float *h = (float *)malloc((size_t)FC_DIM * T * 4);
+        fprintf(stderr, "[perf] flow layer %d (idx=%d) pre\n", fi, idx);
 
         snprintf(nm, sizeof(nm), "flow.flows.%d.pre.weight", idx);
         snprintf(bn, sizeof(bn), "flow.flows.%d.pre.bias", idx);
         if (gpu_conv1d(g, nm, bn, z, 96, T, 1, 1, h, FC_DIM) != 0) { free(h); return -1; }
+        fprintf(stderr, "[perf] flow layer %d pre done\n", fi);
         if (getenv("SPCV_GGML_DUMP") && fi == 0) {
             FILE *f = fopen("scratch/ggml_fb0_pre.bin", "wb");
             if (f) { fwrite(h, sizeof(float), (size_t)FC_DIM * T, f); fclose(f); }
@@ -286,6 +296,7 @@ static int ggml_decoder(spcv_ggml_t *g, const float *z, int T,
     int OL = T * NUP;
     int sr = 48000;
 
+    TMO_BEGIN();
     /* --- har_source: SineGen + m_source (CPU) --- */
     float *har_source = (float *)malloc(OL * 4);
     {
@@ -318,12 +329,15 @@ static int ggml_decoder(spcv_ggml_t *g, const float *z, int T,
         }
     }
 
+    TMO_CHECK("har_source");
     int cur_C = UP_DIM, cur_L = T;
     fprintf(stderr, "[dec] har_source done, OL=%d\n", OL);
+    TMO_BEGIN();
     float *d = (float *)malloc((size_t)UP_DIM * T * 4);
     if (gpu_conv1d(g, "dec.conv_pre.weight", "dec.conv_pre.bias", z, FC_DIM, T, 7, 1, d, UP_DIM) != 0) {
         free(d); free(har_source); return -1;
     }
+    TMO_CHECK("conv_pre");
     { float rms=0; for(int i=0;i<UP_DIM*T;i++) rms+=d[i]*d[i]; fprintf(stderr, "[dec] conv_pre RMS=%.6f\n", sqrtf(rms/(UP_DIM*T))); }
     /* speaker embedding conditioning */
     if (g_emb) {
@@ -351,9 +365,11 @@ static int ggml_decoder(spcv_ggml_t *g, const float *z, int T,
         char wn[256], bn[256];
         snprintf(wn, sizeof(wn), "dec.ups.%d.weight", u);
         snprintf(bn, sizeof(bn), "dec.ups.%d.bias", u);
+        TMO_BEGIN();
         if (gpu_conv_t1d(g, wn, bn, d, cur_C, cur_L, up_K[u], up_stride[u], up_pad[u], d2, nC) != 0) {
             free(d); free(d2); free(har_source); return -1;
         }
+        TMO_CHECK("upsample");
         free(d); d = d2;
         cur_C = nC; cur_L = nL;
         { float rms=0; for(int i=0;i<cur_C*cur_L;i++) rms+=d[i]*d[i]; fprintf(stderr, "[dec] stage %d upsample RMS=%.6f C=%d L=%d\n", u, sqrtf(rms/(cur_C*cur_L)), cur_C, cur_L); }
@@ -409,17 +425,21 @@ static int ggml_decoder(spcv_ggml_t *g, const float *z, int T,
                 snprintf(wn2, sizeof(wn2), "dec.resblocks.%d.convs1.%d.weight", rb_idx, di);
                 snprintf(bn2, sizeof(bn2), "dec.resblocks.%d.convs1.%d.bias", rb_idx, di);
                 float *h = (float *)malloc((size_t)cur_C * cur_L * 4);
-                if (cpu_conv1d(g, wn2, bn2, x, cur_C, cur_L, K, dil, h, cur_C) != 0) {
+                TMO_BEGIN();
+                if (gpu_conv1d(g, wn2, bn2, x, cur_C, cur_L, K, dil, h, cur_C) != 0) {
                     free(x); free(xsave); free(h); free(sum); free(har_source); return -1;
                 }
+                TMO_CHECK("rb_conv1");
                 free(x); x = h;
                 for (int i2 = 0; i2 < cur_C * cur_L; i2++) if (x[i2] < 0) x[i2] *= 0.1f;
                 snprintf(wn2, sizeof(wn2), "dec.resblocks.%d.convs2.%d.weight", rb_idx, di);
                 snprintf(bn2, sizeof(bn2), "dec.resblocks.%d.convs2.%d.bias", rb_idx, di);
                 float *s = (float *)malloc((size_t)cur_C * cur_L * 4);
-                if (cpu_conv1d(g, wn2, bn2, x, cur_C, cur_L, K, 1, s, cur_C) != 0) {
+                TMO_BEGIN();
+                if (gpu_conv1d(g, wn2, bn2, x, cur_C, cur_L, K, 1, s, cur_C) != 0) {
                     free(xsave); free(x); free(s); free(sum); free(har_source); return -1;
                 }
+                TMO_CHECK("rb_conv2");
                 /* residual: x = xsave + s */
                 for (int i = 0; i < cur_C * cur_L; i++) s[i] += xsave[i];
                 free(xsave); free(x); x = s;
@@ -434,9 +454,11 @@ static int ggml_decoder(spcv_ggml_t *g, const float *z, int T,
 
     gpu_leaky_relu(g, d, cur_C * cur_L);
     float *raw = (float *)malloc(cur_L * 4);
+    TMO_BEGIN();
     if (gpu_conv1d(g, "dec.conv_post.weight", NULL, d, cur_C, cur_L, 7, 1, raw, 1) != 0) {
         free(d); free(raw); free(har_source); return -1;
     }
+    TMO_CHECK("conv_post");
     free(d);
     for (int i = 0; i < cur_L; i++) out[i] = tanhf(raw[i]);
     free(raw);
@@ -451,14 +473,17 @@ int spcv_ggml_flow_dec(const char *gguf_path, int be_id, int gpu_id,
                        const float *g_emb, int T,
                        const float *f0,
                        float *out, int *out_len) {
+    fprintf(stderr, "[perf] L449 flow_dec enter be=%d gpu=%d T=%d\n", be_id, gpu_id, T);
     spcv_ggml_t *g = spcv_ggml_load(gguf_path, be_id, gpu_id);
     if (!g) { fprintf(stderr, "[ggml] load fail: %s\n", gguf_path); return -1; }
+    fprintf(stderr, "[perf] L452 loaded, starting flow\n");
 
     float *z = (float *)malloc(FC_DIM * T * 4);
     if (ggml_flow(g, m_p, logs_p, g_emb, T, z) != 0) {
         fprintf(stderr, "[ggml] flow fail\n");
         free(z); spcv_ggml_free(g); return -1;
     }
+    fprintf(stderr, "[perf] L458 flow done\n");
 
     if (getenv("SPCV_GGML_DUMP")) {
         FILE *f = fopen("scratch/ggml_flow_z.bin", "wb");

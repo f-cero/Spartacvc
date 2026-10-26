@@ -50,6 +50,7 @@ static double spcv_t0 = 0.0, spcv_t_start = 0.0;
 #include "pth2gguf.h"
 #include "gguf_check.h"
 #include "ggml_pipeline.h"
+#include "ggml_rvc_enc_gpu.h"
 
 /* from gpu_list.c */
 int spcv_list_gpus(void);
@@ -407,9 +408,11 @@ int main(int argc, char **argv) {
 
     /* 2. Load voice model — .pth (pure C), .onnx (ORT), or ONNX from stdin */
     int is_pth = (voice_path && strlen(voice_path) > 4 && strcmp(voice_path + strlen(voice_path) - 4, ".pth") == 0);
+    int is_gguf = (voice_path && strlen(voice_path) > 5 && strcmp(voice_path + strlen(voice_path) - 5, ".gguf") == 0);
     rvc_model_t *rvc = malloc(sizeof(rvc_model_t)); /* heap: 1.4 MB, not stack */
     spcv_onnx_session *voice = NULL;
     int model_sr = 0, model_fps = 0, model_dim = 0;
+    float *emb_g_buf = NULL; int emb_g_dim = 0; /* for .gguf: speaker emb from file */
 
     if (voice_stdin) {
         SPCV_TRACE("main", "reading voice ONNX from stdin...");
@@ -437,6 +440,42 @@ int main(int argc, char **argv) {
         model_fps = rvc->fps;
         model_dim = rvc->cfg.ques;
         SPCV_TRACE("main", ".pth model: sr=%d fps=%d dim=%d", model_sr, model_fps, model_dim);
+    } else if (is_gguf) {
+        /* .gguf voice: read config + emb_g directly from GGUF file */
+        SPCV_TRACE("main", "loading .gguf voice: %s", voice_path);
+        struct ggml_context *tmp_ctx = NULL;
+        struct gguf_init_params gp = { false, &tmp_ctx };
+        struct gguf_context *gfg = gguf_init_from_file(voice_path, gp);
+        if (!gfg) { fprintf(stderr, "FATAL: cannot open GGUF: %s\n", voice_path); return 1; }
+        /* config from metadata (fallback to RVC v2 defaults) */
+        model_sr = 48000; model_fps = 100; model_dim = 768;
+        int64_t k;
+        if ((k = gguf_find_key(gfg, "rvc.sample_rate")) >= 0) model_sr = (int)gguf_get_val_u32(gfg, k);
+        if ((k = gguf_find_key(gfg, "rvc.frame_rate")) >= 0) model_fps = (int)gguf_get_val_u32(gfg, k);
+        if ((k = gguf_find_key(gfg, "rvc.hidden_channels")) >= 0) rvc->cfg.p_dim = (int)gguf_get_val_u32(gfg, k);
+        /* read emb_g.weight [256] */
+        int64_t tid = gguf_find_tensor(gfg, "emb_g.weight");
+        if (tid >= 0) {
+            const int64_t *ne = gguf_get_tensor_ne(gfg, tid);
+            emb_g_dim = (int)ne[0];
+            emb_g_buf = (float *)malloc((size_t)emb_g_dim * 4);
+            size_t data_off = gguf_get_data_offset(gfg);
+            size_t off = gguf_get_tensor_offset(gfg, tid);
+            FILE *gf = fopen(voice_path, "rb");
+            fseek(gf, (long)(data_off + off), SEEK_SET);
+            fread(emb_g_buf, 4, (size_t)emb_g_dim, gf);
+            fclose(gf);
+        }
+        gguf_free(gfg);
+        if (tmp_ctx) ggml_free(tmp_ctx);
+        rvc->emb_g = emb_g_buf;
+        rvc->emb_g_dim = emb_g_dim;
+        rvc->cfg.sr = model_sr;
+        rvc->cfg.ques = model_dim;
+        rvc->fps = model_fps;
+        if (rvc->cfg.p_dim == 0) rvc->cfg.p_dim = 192;
+        SPCV_TRACE("main", ".gguf model: sr=%d fps=%d dim=%d emb_g=%d", model_sr, model_fps, model_dim, emb_g_dim);
+        gguf_path = voice_path; /* use this file for ggml pipeline */
     } else {
         SPCV_TRACE("main", "loading .onnx voice: %s", voice_path);
         if (spcv_onnx_load(voice_path, &voice) != SPCV_ONNX_OK) {
@@ -581,7 +620,7 @@ int main(int argc, char **argv) {
     float *pcm = NULL;
     int64_t out_n = 0;
 
-    if (is_pth) {
+    if (is_pth || is_gguf) {
         /* Debug: check HuBERT feature range */
         {
             int64_t n = t_model * emb_dim;
@@ -604,17 +643,35 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[dump] emb_model T=%lld dim=%d, pitch, f0_model, emb_g -> scratch/\n", (long long)t_model, emb_dim);
         }
         if (gguf_path) {
-            /* GGML path: pure-C encoder + ggml flow+decoder on GPU */
+            /* GGML path: encoder + flow+decoder all on GPU */
             int ggml_be = (main_ep == SPCV_EP_CUDA) ? 1 : 0;
-            fprintf(stderr, "[ggml] encoder (CPU) + flow+dec (be=%d gpu=%d)\n", ggml_be, gpu_id);
-            /* Run encoder on CPU */
+            fprintf(stderr, "[ggml] encoder + flow+dec (be=%d gpu=%d)\n", ggml_be, gpu_id);
+            /* Run encoder on GPU */
             int FC = rvc->cfg.p_dim;
             float *m_p = malloc((size_t)FC * t_model * sizeof(float));
             float *logs_p = malloc((size_t)FC * t_model * sizeof(float));
-            if (rvc_encoder_forward(rvc, emb_model, (int)t_model, pitch, m_p, logs_p) != 0) {
-                fprintf(stderr, "FATAL: encoder\n"); return 1;
+            if (is_gguf || getenv("SPCV_GGML_ENC")) {
+                fprintf(stderr, "[perf] encoder (GGML) start\n");
+                if (spcv_ggml_encoder(gguf_path, ggml_be, gpu_id,
+                                      emb_model, emb_dim, (int)t_model, pitch,
+                                      m_p, logs_p) != 0) {
+                    fprintf(stderr, "FATAL: ggml encoder\n"); return 1;
+                }
+                fprintf(stderr, "[perf] encoder (GGML) done\n");
+                SPCV_MARK("encoder (GGML)");
+            } else {
+                if (rvc_encoder_forward(rvc, emb_model, (int)t_model, pitch, m_p, logs_p) != 0) {
+                    fprintf(stderr, "FATAL: encoder\n"); return 1;
+                }
+                if (getenv("SPCV_DBG_ENC")) {
+                    FILE *f = fopen("scratch/c_enc_m_p.bin", "wb");
+                    fwrite(m_p, 4, (size_t)FC * t_model, f); fclose(f);
+                    f = fopen("scratch/c_enc_logs_p.bin", "wb");
+                    fwrite(logs_p, 4, (size_t)FC * t_model, f); fclose(f);
+                    fprintf(stderr, "[dump] pure-C encoder m_p/logs_p -> scratch/\n");
+                }
+                SPCV_MARK("encoder (C)");
             }
-            SPCV_MARK("encoder (CPU)");
             /* Run flow+decoder on GPU */
             int out_len = 0;
             float *out_buf = malloc((size_t)t_model * 480 * sizeof(float));
