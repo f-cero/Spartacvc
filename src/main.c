@@ -644,7 +644,7 @@ int main(int argc, char **argv) {
         }
         if (gguf_path) {
             /* GGML path: encoder + flow+decoder all on GPU */
-            int ggml_be = (main_ep == SPCV_EP_CUDA) ? 1 : 0;
+            int ggml_be = (main_ep == SPCV_EP_CUDA) ? 1 : (main_ep == SPCV_EP_VULKAN) ? 3 : 0;
             fprintf(stderr, "[ggml] encoder + flow+dec (be=%d gpu=%d)\n", ggml_be, gpu_id);
             /* Run encoder on GPU */
             int FC = rvc->cfg.p_dim;

@@ -35,9 +35,10 @@ extern "C" {
 
 // Backend selection for spcv_ggml_load().
 enum {
-    SPCV_BE_CPU  = 0,   // CPU only
-    SPCV_BE_CUDA = 1,   // NVIDIA CUDA
-    SPCV_BE_AUTO = 2    // CUDA if available, else CPU
+    SPCV_BE_CPU    = 0,  // CPU only
+    SPCV_BE_CUDA   = 1,  // NVIDIA CUDA
+    SPCV_BE_VULKAN = 3,  // AMD/Intel Vulkan
+    SPCV_BE_AUTO   = 2   // CUDA if available, else CPU
 };
 
 // Opaque handle.

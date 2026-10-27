@@ -9,6 +9,7 @@
 #include "gguf_load.h"
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
+#include "ggml-vulkan.h"
 #include "ggml-alloc.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,8 +59,17 @@ spcv_ggml_t * spcv_ggml_load(const char *path, int be, int dev) {
 
     // 2. Pick the compute backend.
     int want_cuda = (be == SPCV_BE_CUDA) || (be == SPCV_BE_AUTO);
+    int want_vk = (be == SPCV_BE_VULKAN);
     g->be = NULL;
-    if (want_cuda) {
+    if (want_vk) {
+        int n = ggml_backend_vk_get_device_count();
+        if (n > 0) {
+            if (dev >= n) dev = 0;
+            g->be = ggml_backend_vk_init(dev);
+            if (g->be) g->be_id = 3;
+        }
+        if (!g->be) { fprintf(stderr, "[gguf] Vulkan requested but unavailable\n"); }
+    } else if (want_cuda) {
         int n = ggml_backend_cuda_get_device_count();
         if (n > 0) {
             if (dev >= n) dev = 0;
@@ -114,7 +124,7 @@ spcv_ggml_t * spcv_ggml_load(const char *path, int be, int dev) {
 
     printf("[gguf] loaded %s: %lld tensors on %s (dev %d)\n",
            path, (long long)gguf_get_n_tensors(g->gguf),
-           g->be_id == 1 ? "CUDA" : "CPU", dev);
+           g->be_id == 1 ? "CUDA" : g->be_id == 3 ? "Vulkan" : "CPU", dev);
     return g;
 }
 
