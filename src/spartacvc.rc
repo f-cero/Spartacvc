@@ -1,0 +1,2 @@
+#include <windows.h>
+IDR_MAINICON ICON DISCARDABLE "spartacvc.ico"
