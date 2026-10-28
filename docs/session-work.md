@@ -151,3 +151,72 @@ Session: 2026-10-06T23:17:52Z → 2026-10-17T01:17:48Z
 8. **Pickle format:** .pth = ZIP containing `archive/data/*` (tensors) + `archive/data.pkl` (structure). TensorProto protobuf inside.
 9. **Protobuf raw_data:** field 9 in TensorProto. Must size correctly by dtype.
 10. **Constant classification:** By dtype (data_type field), NOT by byte length. INT32 and FLOAT are both 4 bytes.
+
+---
+
+## Phase 5: GGML/Vulkan + Tray App (Oct 27)
+
+### GGML Pipeline Complete (all verified)
+- **Encoder** through ggml ops on CUDA (PG500): maxabs=0.000356 PASS
+- **Flow** through ggml conv_1d on CUDA: CPU vs CUDA maxabs=0.0017 PASS
+- **Decoder** through ggml ops on CUDA: all 4 stages PASS
+- **Full pipeline** integrated into `spartacvc.exe`: 2.4s for 4.1s audio (9x faster than pure-C)
+- **Vulkan backend** (AMD Vega FE): STT verified, 13.8s for 4.1s audio
+- **`--voice model.gguf`** single-file mode works (no .pth needed at runtime)
+- **172s → 2.5s** perf fix (encoder was the bottleneck, now on GPU)
+
+### Tray App (in progress)
+- `src/tray.c` — Win32 tray icon, right-click menu, backend selection
+- `src/tray_main.c` — WinMain entry point
+- `src/wasapi.h/.c` — WASAPI capture/render + device enumeration (COM in C)
+- `src/pipeline_rt.h/.c` — real-time worker thread (pass-through placeholder)
+- `src/spartacvc.ico` — placeholder icon (S on dark bg)
+- `src/spartacvc.rc` — icon resource
+- `build_tray.bat` — builds `spartacvc_tray.exe` (212MB static)
+- **All strings wide/UTF-16** for international release
+- **NOT YET WORKING:** Start/Stop, model loading, file conversion, device selection
+
+### What's Next (tray app TODO)
+1. **Expand tray.c menu:** model listing from `models/voices/`, file conversion, device picker
+2. **Wire "Convert file..."** — call spartacvc.exe CLI with picked WAV + model
+3. **Wire "Start/Stop"** — launch rt_worker thread (WASAPI capture → RVC → render)
+4. **Device enumeration** — show input/output devices in menu, let user pick
+5. **Model history** — remember last N models used
+6. **Build with icon resource** — use `rc.exe` to compile spartacvc.rc
+7. **True real-time** — replace pass-through with actual pipeline call in rt_worker
+
+### Key Files
+| File | Purpose |
+|------|---------|
+| `src/tray.c` | Tray icon, menu, message loop |
+| `src/tray_main.c` | WinMain entry |
+| `src/wasapi.c` | WASAPI capture/render (COM) |
+| `src/pipeline_rt.c` | Real-time worker thread |
+| `src/ggml_pipeline.c` | Flow+decoder on GPU (ggml) |
+| `src/ggml_rvc_enc_gpu.c` | Encoder on GPU (ggml) |
+| `src/gguf_load.c` | GGUF → ggml tensor loading |
+| `src/main.c` | CLI entry (file conversion) |
+| `build_tray.bat` | Build tray exe |
+| `build_spcv.bat` | Build CLI exe |
+
+### Build Commands
+```bash
+# CLI (full pipeline, file conversion)
+cmd //c build_spcv.bat
+
+# Tray app (WASAPI + menu)
+cmd //c build_tray.bat
+
+# Run CLI
+spartacvc.exe input.wav --voice models/voices/nahida-jp.gguf --backend cuda --out out.wav
+
+# Run tray
+spartacvc_tray.exe
+```
+
+### GPU Status
+| GPU | Backend | Status |
+|-----|---------|--------|
+| Tesla PG500-216 (V100 lite, sm_70, TCC, 32GB) | CUDA | ✅ 2.4s/4.1s |
+| Radeon Vega Frontier Edition | Vulkan | ✅ 13.8s/4.1s |
+| CPU (48 cores) | ggml-cpu | ✅ works |
