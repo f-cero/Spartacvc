@@ -93,11 +93,9 @@ static DWORD WINAPI rt_worker(LPVOID arg) {
     // Chunk: 200ms at input rate
     int chunk_samples = in_rate / 5; // 200ms
     float *in_buf = (float *)malloc((size_t)chunk_samples * in_ch * sizeof(float));
-    float *out_buf = (float *)malloc((size_t)chunk_samples * 480 * out_ch * sizeof(float));
-    // Note: output is 480x longer than input frames (100fps * 480 = 48kHz)
-    // But input 200ms → output 200ms (voice conversion preserves duration)
-    // Actually: T frames in → T*480 samples out. T = 200ms*100fps = 20 frames.
-    // Output = 20*480 = 9600 samples @ 48kHz = 200ms. Same duration!
+    float *out_buf = (float *)malloc((size_t)chunk_samples * out_ch * sizeof(float));
+    // Pass-through: output same duration as input.
+    // Real RVC: T frames in → T*hop samples out (same duration).
 
     while (!g_stop) {
         int n = wasapi_capture_read(cap, in_buf, chunk_samples);

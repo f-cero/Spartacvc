@@ -165,25 +165,39 @@ Session: 2026-10-06T23:17:52Z → 2026-10-17T01:17:48Z
 - **`--voice model.gguf`** single-file mode works (no .pth needed at runtime)
 - **172s → 2.5s** perf fix (encoder was the bottleneck, now on GPU)
 
-### Tray App (in progress)
-- `src/tray.c` — Win32 tray icon, right-click menu, backend selection
+### Tray App (working, Oct 29)
+- `src/tray.c` — Win32 tray icon, full menu (backend/model/devices/convert/start-stop/quit)
 - `src/tray_main.c` — WinMain entry point
-- `src/wasapi.h/.c` — WASAPI capture/render + device enumeration (COM in C)
+- `src/wasapi.h/.c` — WASAPI capture/render + device enumeration (COM in C, vtable calls)
 - `src/pipeline_rt.h/.c` — real-time worker thread (pass-through placeholder)
+- `src/com_guids.c` — manual COM GUID definitions (SDK lib doesn't export them)
 - `src/spartacvc.ico` — placeholder icon (S on dark bg)
-- `src/spartacvc.rc` — icon resource
-- `build_tray.bat` — builds `spartacvc_tray.exe` (212MB static)
+- `src/spartacvc.res` — compiled icon resource (276KB)
+- `build_tray.bat` — builds `spartacvc_tray.exe` (203MB static)
 - **All strings wide/UTF-16** for international release
-- **NOT YET WORKING:** Start/Stop, model loading, file conversion, device selection
+- **WORKING:** backend selection, model listing, device enumeration, Convert file (via CLI), Start/Stop (pass-through)
+- **NOT YET:** true real-time RVC in rt_worker (currently identity pass-through)
 
-### What's Next (tray app TODO)
-1. **Expand tray.c menu:** model listing from `models/voices/`, file conversion, device picker
-2. **Wire "Convert file..."** — call spartacvc.exe CLI with picked WAV + model
-3. **Wire "Start/Stop"** — launch rt_worker thread (WASAPI capture → RVC → render)
-4. **Device enumeration** — show input/output devices in menu, let user pick
-5. **Model history** — remember last N models used
-6. **Build with icon resource** — use `rc.exe` to compile spartacvc.rc
-7. **True real-time** — replace pass-through with actual pipeline call in rt_worker
+### Tray App Bugs Fixed (Oct 29)
+- `eDataFlow` → `EDataFlow` (capital E in SDK)
+- `IMMDevice_GetProperty` doesn't exist → use `OpenPropertyStore` + `IPropertyStore::GetValue`
+- `WAVEFORMATEXTENSIBLE` cast fails → just report base format, WASAPI auto-converts
+- COM GUIDs (`IID_*`, `CLSID_*`) not in mmdevapi.lib → manual definitions in `com_guids.c`
+- `ShellBrowseForFolderW` not available → removed browse, rescan instead
+- `MB_ICONCHECK` doesn't exist → `MB_ICONINFORMATION`
+- `pkt_size` is `UINT64` not `DWORD`
+- `GetProperty` takes `const PROPERTYKEY*` not `const DEVPROPKEY*`
+- `wasapi_co_init/uninit` were declared but never implemented
+- `do_convert_file` needed full path to spartacvc.exe + hubert/rmvpe args
+- rt_worker output buffer was `chunk_samples * 480` (way too big) → `chunk_samples`
+
+### What's Next
+1. **True real-time RVC** — link pipeline code into tray app, replace pass-through
+2. **Model directory browse** — proper folder picker (needs comctl32 v6 manifest)
+3. **Model history** — remember last N models used
+4. **Virtual mic** — output to VB-Cable or WASAPI virtual device
+5. **Config persistence** — save backend/model/device selection to config.json
+6. **Icon** — replace placeholder with proper design
 
 ### Key Files
 | File | Purpose |

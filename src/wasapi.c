@@ -121,7 +121,8 @@ int wasapi_capture_read(wasapi_cap_t *c, float *buf, int n) {
 
     BYTE *data = NULL;
     UINT32 frames = 0;
-    DWORD pkt_size = 0, flags = 0;
+    DWORD flags = 0;
+    UINT64 pkt_size = 0;
 
     HRESULT hr;
     int tries = 0;
@@ -251,7 +252,7 @@ static int enum_devices(EDataFlow flow, wasapi_dev_t *devs, int max_n) {
         if (SUCCEEDED(dev->lpVtbl->OpenPropertyStore(dev, STGM_READ, (IUnknown **)&store))) {
             PROPVARIANT pv;
             ZeroMemory(&pv, sizeof(pv));
-            if (SUCCEEDED(store->lpVtbl->GetValue(store, &DEVPKEY_Device_FriendlyName, &pv))) {
+            if (SUCCEEDED(store->lpVtbl->GetValue(store, (const PROPERTYKEY *)&DEVPKEY_Device_FriendlyName, &pv))) {
                 if (pv.vt == VT_BSTR && pv.pwszVal)
                     lstrcpynW(friendly, pv.pwszVal, 256);
                 PropVariantClear(&pv);

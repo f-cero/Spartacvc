@@ -150,47 +150,77 @@ static void scan_devices(void) {
 
 // --- Convert file (call spartacvc.exe CLI) ---
 static void do_convert_file(void) {
+    if (g_n_models == 0) {
+        MessageBoxW(g_hwnd, L"No models found.\nPlace .gguf or .pth files in models\\voices\\",
+                    L"Spartacv\u03C2", MB_ICONWARNING);
+        return;
+    }
+
     wchar_t in_file[260] = L"";
     wchar_t out_file[260] = L"";
 
-    OPENFILENAMEW ofn_in = { sizeof(ofn_in) };
-    ofn_in.hwndOwner = g_hwnd;
-    ofn_in.lpstrFilter = L"WAV files\0*.wav\0All files\0*.*\0";
-    ofn_in.lpstrFile = in_file;
-    ofn_in.nMaxFile = 260;
-    ofn_in.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    if (!GetOpenFileNameW(&ofn_in)) return;
+    OPENFILENAMEW ofn = { sizeof(ofn) };
+    ofn.hwndOwner = g_hwnd;
+    ofn.lpstrFilter = L"WAV files\0*.wav\0All files\0*.*\0";
+    ofn.lpstrFile = in_file;
+    ofn.nMaxFile = 260;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&ofn)) return;
 
-    ofn_in.lpstrFile = out_file;
-    ofn_in.nMaxFile = 260;
-    ofn_in.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
-    ofn_in.lpstrDefExt = L"wav";
-    if (!GetSaveFileNameW(&ofn_in)) return;
+    ofn.lpstrFile = out_file;
+    ofn.lpstrDefExt = L"wav";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    if (!GetSaveFileNameW(&ofn)) return;
 
-    // Build model path
+    // Full model path
     wchar_t model_path[300];
-    if (wcslen(g_models[g_sel_model]) < 260 && g_models[g_sel_model][wcslen(g_models[g_sel_model])-1] != L'\\') {
-        swprintf(model_path, 300, L"%s\\%s", g_model_dir, g_models[g_sel_model]);
-    } else {
-        wcscpy_s(model_path, 300, g_models[g_sel_model]);
-    }
+    swprintf(model_path, 300, L"%s\\%s", g_model_dir, g_models[g_sel_model]);
 
     const wchar_t *be = (g_backends[g_sel_be].be_id == 1) ? L"cuda"
                        : (g_backends[g_sel_be].be_id == 3) ? L"vulkan" : L"cpu";
 
-    wchar_t cmd[1024];
-    swprintf(cmd, 1024,
-        L"spartacvc.exe \"%s\" --voice \"%s\" --backend %s --out \"%s\"",
-        in_file, model_path, be, out_file);
+    // Find spartacvc.exe next to this exe
+    wchar_t exe_dir[260];
+    GetModuleFileNameW(NULL, exe_dir, 260);
+    wchar_t *slash = wcsrchr(exe_dir, L'\\');
+    if (slash) *(slash + 1) = 0;
+    wchar_t cli_path[300];
+    swprintf(cli_path, 300, L"%sspartacvc.exe", exe_dir);
+
+    // Hubert + RMVPE paths (relative to exe dir)
+    wchar_t hubert[300], rmvpe[300];
+    swprintf(hubert, 300, L"%smodels\base\vec-768-layer-12.onnx", exe_dir);
+    swprintf(rmvpe, 300, L"%smodels\base\rmvpe.onnx", exe_dir);
+
+    wchar_t cmd[2048];
+    swprintf(cmd, 2048,
+        L"\"%s\" \"%s\" --voice \"%s\" --hubert \"%s\" --rmvpe \"%s\" --backend %s --out \"%s\"",
+        cli_path, in_file, model_path, hubert, rmvpe, be, out_file);
+
+    // Show progress
+    MessageBoxW(g_hwnd, L"Converting...\nThis may take a minute.", L"Spartacv\u03C2", MB_OK);
 
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {0};
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
-    CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        exe_dir, NULL, &si, &pi)) {
+        MessageBoxW(g_hwnd, L"Failed to launch spartacvc.exe",
+                    L"Spartacv\u03C2", MB_ICONERROR);
+        return;
+    }
     WaitForSingleObject(pi.hProcess, 120000);
+    DWORD exit_code = 0;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+
+    if (exit_code == 0)
+        MessageBoxW(g_hwnd, L"Conversion complete.", L"Spartacv\u03C2", MB_OK | MB_ICONINFORMATION);
+    else
+        swprintf(cmd, 2048, L"Conversion failed (exit code %lu).", exit_code),
+        MessageBoxW(g_hwnd, cmd, L"Spartacv\u03C2", MB_ICONERROR);
 }
 
 // --- Tray icon ---
