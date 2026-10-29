@@ -73,6 +73,8 @@ static int  g_sel_out = 0;
 
 static int  g_running = 0;
 
+static void save_config(void);
+
 static NOTIFYICONDATAW g_nid = {0};
 static HWND   g_hwnd  = NULL;
 static HICON  g_hicon = NULL;
@@ -303,8 +305,10 @@ static void show_menu(void) {
     if (cmd >= ID_BASE && cmd < ID_BASE + MAX_BACKENDS) {
         g_sel_be = cmd - ID_BASE;
         update_tip();
+        save_config();
     } else if (cmd >= ID_MODEL_BASE && cmd < ID_MODEL_BASE + MAX_MODELS) {
         g_sel_model = cmd - ID_MODEL_BASE;
+        save_config();
     } else if (cmd == ID_MODEL_BROWSE) {
         // Simple input dialog for model directory
         wchar_t buf[260];
@@ -314,8 +318,10 @@ static void show_menu(void) {
         scan_models();
     } else if (cmd >= ID_DEV_IN_BASE && cmd < ID_DEV_IN_BASE + MAX_DEVS) {
         g_sel_in = cmd - ID_DEV_IN_BASE;
+        save_config();
     } else if (cmd >= ID_DEV_OUT_BASE && cmd < ID_DEV_OUT_BASE + MAX_DEVS) {
         g_sel_out = cmd - ID_DEV_OUT_BASE;
+        save_config();
     } else if (cmd == ID_START) {
         if (!g_running) {
             if (g_n_models == 0) {
@@ -373,11 +379,67 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// --- Config persistence (simple key=value text file) ---
+static wchar_t g_cfg_path[300] = L"";
+
+static void cfg_path_init(void) {
+    wchar_t exe_dir[260];
+    GetModuleFileNameW(NULL, exe_dir, 260);
+    wchar_t *sl = wcsrchr(exe_dir, L'\\');
+    if (sl) *(sl+1) = 0;
+    swprintf(g_cfg_path, 300, L"%sspartacvc.cfg", exe_dir);
+}
+
+static void save_config(void) {
+    FILE *f = _wfopen(g_cfg_path, L"w");
+    if (!f) return;
+    fwprintf(f, L"backend=%d\n", g_sel_be);
+    fwprintf(f, L"model=%s\n", g_n_models > 0 ? g_models[g_sel_model] : L"");
+    fwprintf(f, L"model_dir=%s\n", g_model_dir);
+    fwprintf(f, L"dev_in=%d\n", g_sel_in);
+    fwprintf(f, L"dev_out=%d\n", g_sel_out);
+    fclose(f);
+}
+
+static void load_config(void) {
+    FILE *f = _wfopen(g_cfg_path, L"r");
+    if (!f) return;
+    wchar_t line[512];
+    while (fgetws(line, 512, f)) {
+        // strip newline
+        int len = (int)wcslen(line);
+        while (len > 0 && (line[len-1] == L'\n' || line[len-1] == L'\r')) line[--len] = 0;
+        if (wcsncmp(line, L"backend=", 8) == 0) {
+            int v = wcstol(line + 8, NULL, 10);
+            if (v >= 0 && v < g_n_backends) g_sel_be = v;
+        } else if (wcsncmp(line, L"model=", 6) == 0) {
+            const wchar_t *name = line + 6;
+            if (name[0]) {
+                for (int i = 0; i < g_n_models; i++) {
+                    if (wcscmp(g_models[i], name) == 0) { g_sel_model = i; break; }
+                }
+            }
+        } else if (wcsncmp(line, L"model_dir=", 10) == 0) {
+            const wchar_t *d = line + 10;
+            if (d[0]) wcscpy_s(g_model_dir, 260, d);
+        } else if (wcsncmp(line, L"dev_in=", 7) == 0) {
+            int v = wcstol(line + 7, NULL, 10);
+            if (v >= 0 && v < g_n_dev_in) g_sel_in = v;
+        } else if (wcsncmp(line, L"dev_out=", 8) == 0) {
+            int v = wcstol(line + 8, NULL, 10);
+            if (v >= 0 && v < g_n_dev_out) g_sel_out = v;
+        }
+    }
+    fclose(f);
+}
+
 // --- Main ---
 int spcv_tray_run(void) {
+    cfg_path_init();
     probe_backends();
     scan_models();
     scan_devices();
+    load_config();  // restore saved selections
 
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(wc);
