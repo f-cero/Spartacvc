@@ -318,11 +318,29 @@ static void show_menu(void) {
         g_sel_out = cmd - ID_DEV_OUT_BASE;
     } else if (cmd == ID_START) {
         if (!g_running) {
+            if (g_n_models == 0) {
+                MessageBoxW(g_hwnd, L"No model selected.", L"Spartacv\u03C2", MB_ICONWARNING);
+                return;
+            }
             g_running = 1;
             update_tip();
             const wchar_t *in_id = (g_n_dev_in > 0) ? g_dev_in[g_sel_in].id : NULL;
             const wchar_t *out_id = (g_n_dev_out > 0) ? g_dev_out[g_sel_out].id : NULL;
-            spcv_rt_start(NULL, g_backends[g_sel_be].be_id, 0, in_id, out_id, NULL, NULL);
+
+            // Build full paths
+            wchar_t model_path[300];
+            swprintf(model_path, 300, L"%s\\%s", g_model_dir, g_models[g_sel_model]);
+
+            wchar_t exe_dir[260];
+            GetModuleFileNameW(NULL, exe_dir, 260);
+            wchar_t *sl = wcsrchr(exe_dir, L'\\');
+            if (sl) *(sl+1) = 0;
+            wchar_t hubert[300], rmvpe[300];
+            swprintf(hubert, 300, L"%smodels\base\vec-768-layer-12.onnx", exe_dir);
+            swprintf(rmvpe, 300, L"%smodels\base\rmvpe.onnx", exe_dir);
+
+            spcv_rt_start(model_path, g_backends[g_sel_be].be_id, 0,
+                          in_id, out_id, hubert, rmvpe);
         }
     } else if (cmd == ID_STOP) {
         if (g_running) {
