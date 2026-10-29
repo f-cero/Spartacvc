@@ -1,33 +1,41 @@
 // wasapi.c — WASAPI capture/render implementation.
 //
-// Uses COM + IAudioClient in shared mode with 32-bit float format.
-// Capture: reads from mic in a blocking loop.
-// Render:  writes to speakers/virtual cable in a blocking loop.
-//
-// COM interfaces are used directly (no C++ smart pointers).
-// All COM pointers are freed on close.
+// Shared-mode, 32-bit float. COM in C (no C++ smart pointers).
+// Capture: GetBuffer → memcpy → ReleaseBuffer (polling loop).
+// Render:  GetBuffer → memcpy → ReleaseBuffer (polling loop).
 
+#define INITGUID  // Must be before guiddef.h (pulled in by windows.h)
 #define COBJMACROS
 #include "wasapi.h"
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <AudioSessionTypes.h>
+#include <devpkey.h>
+#include <propsys.h>
+#include <mmreg.h>
 #include <stdio.h>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 
-static HRESULT g_com_state = CO_E_NOTINITIALIZED;
-
 int wasapi_co_init(void) {
-    return CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    return (int)CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 }
 
 void wasapi_co_uninit(void) {
-    if (g_com_state == S_OK) CoUninitialize();
+    CoUninitialize();
 }
 
+// HRESULTs not in older SDK headers
+#ifndef AUDCLNT_E_BUFFER_EMPTY
+#define AUDCLNT_E_BUFFER_EMPTY  ((HRESULT)0x88890004)
+#endif
+#ifndef AUDCLNT_E_BUFFER_FULL
+#define AUDCLNT_E_BUFFER_FULL   ((HRESULT)0x8889000A)
+#endif
+
 // --- Helper: get a device ---
-static IMMDevice * get_device(const wchar_t *dev_id, ERole role) {
+static IMMDevice * get_device(const wchar_t *dev_id, EDataFlow flow) {
     IMMDeviceEnumerator *enumr = NULL;
     IMMDevice *dev = NULL;
     HRESULT hr;
@@ -37,40 +45,34 @@ static IMMDevice * get_device(const wchar_t *dev_id, ERole role) {
     if (FAILED(hr)) return NULL;
 
     if (dev_id)
-        hr = enumr->lpVtbl->GetDevice(enumr, dev_id, &dev);
+        hr = IMMDeviceEnumerator_GetDevice(enumr, dev_id, &dev);
     else
-        hr = enumr->lpVtbl->GetDefaultAudioEndpoint(enumr, role, eConsole, &dev);
+        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumr, flow, eConsole, &dev);
 
-    enumr->lpVtbl->Release(enumr);
-    return (SUCCEEDED(hr)) ? dev : NULL;
+    IMMDeviceEnumerator_Release(enumr);
+    return SUCCEEDED(hr) ? dev : NULL;
 }
 
-// --- Helper: activate IAudioClient from a device ---
+// --- Helper: activate IAudioClient ---
 static IAudioClient * activate_client(IMMDevice *dev) {
     IAudioClient *client = NULL;
-    HRESULT hr = dev->lpVtbl->Activate(dev, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&client);
-    dev->lpVtbl->Release(dev);
+    HRESULT hr = IMMDevice_Activate(dev, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&client);
+    IMMDevice_Release(dev);
     return SUCCEEDED(hr) ? client : NULL;
 }
 
-// --- Helper: negotiate 32-bit float mix format ---
+// --- Helper: get 32-bit float format ---
 static WAVEFORMATEX * get_float_format(IAudioClient *client, int *rate, int *chans) {
     WAVEFORMATEX *mix = NULL;
-    client->lpVtbl->GetMixFormat(client, &mix);
-    if (mix->wFormatTag == WAVEFORMATEXTENSIBLE) {
-        WAVEFORMATEXTENSIBLE *ext = (WAVEFORMATEXTENSIBLE *)mix;
-        // Convert to plain PCM float
-        static WAVEFORMATEX pcm;
-        ZeroMemory(&pcm, sizeof(pcm));
-        pcm.wFormatTag = WAVEFORMATEX_PCM;
-        pcm.nChannels = ext->nChannels;
-        pcm.nSamplesPerSec = ext->nSamplesPerSec;
-        pcm.nBlockAlign = ext->nChannels * 4;
-        pcm.nAvgBytesPerSec = ext->nSamplesPerSec * ext->nChannels * 4;
-        pcm.wBitsPerSample = 32;
-        *rate = ext->nSamplesPerSec;
-        *chans = ext->nChannels;
-        return &pcm;
+    IAudioClient_GetMixFormat(client, &mix);
+    if (!mix) return NULL;
+
+    if (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        // WAVEFORMATEXTENSIBLE: first 18 bytes are WAVEFORMATEX, then extras
+        // We just report the base format; WASAPI will auto-convert to float32
+        *rate = mix->nSamplesPerSec;
+        *chans = mix->nChannels;
+        return mix;
     }
     *rate = mix->nSamplesPerSec;
     *chans = mix->nChannels;
@@ -80,11 +82,10 @@ static WAVEFORMATEX * get_float_format(IAudioClient *client, int *rate, int *cha
 // ==================== CAPTURE ====================
 
 struct wasapi_cap {
-    IAudioClient    *client;
+    IAudioClient *client;
     IAudioCaptureClient *cap;
-    WAVEFORMATEX    *fmt;
-    int             rate;
-    int             channels;
+    int rate;
+    int channels;
 };
 
 wasapi_cap_t * wasapi_capture_open(const wchar_t *dev_id) {
@@ -96,21 +97,20 @@ wasapi_cap_t * wasapi_capture_open(const wchar_t *dev_id) {
 
     int rate, chans;
     WAVEFORMATEX *fmt = get_float_format(client, &rate, &chans);
+    if (!fmt) { IAudioClient_Release(client); return NULL; }
 
-    // Initialize in shared mode, event-driven
-    AUDCLNT_STREAMFLAGS flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    HRESULT hr = client->lpVtbl->Initialize(client, AUDCLNT_SHAREMODE_SHARED, flags,
-                                             200000, 0, fmt, NULL); // 200ms buffer
-    if (FAILED(hr)) { client->lpVtbl->Release(client); return NULL; }
+    HRESULT hr = IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+        200000, 0, fmt, NULL);
+    if (FAILED(hr)) { IAudioClient_Release(client); return NULL; }
 
     IAudioCaptureClient *cap = NULL;
-    hr = client->lpVtbl->GetService(client, &IID_IAudioCaptureClient, (void **)&cap);
-    if (FAILED(hr)) { client->lpVtbl->Release(client); return NULL; }
+    hr = IAudioClient_GetService(client, &IID_IAudioCaptureClient, (void **)&cap);
+    if (FAILED(hr)) { IAudioClient_Release(client); return NULL; }
 
     wasapi_cap_t *c = (wasapi_cap_t *)calloc(1, sizeof(*c));
     c->client = client;
     c->cap = cap;
-    c->fmt = fmt;
     c->rate = rate;
     c->channels = chans;
     return c;
@@ -119,25 +119,24 @@ wasapi_cap_t * wasapi_capture_open(const wchar_t *dev_id) {
 int wasapi_capture_read(wasapi_cap_t *c, float *buf, int n) {
     if (!c || !c->cap) return -1;
 
-    // Get available data
-    UINT32 frames = 0;
     BYTE *data = NULL;
-    DWORD pkt_size = 0;
-    DWORD flags = 0;
+    UINT32 frames = 0;
+    DWORD pkt_size = 0, flags = 0;
 
-    // Wait for data (blocking via GetBuffer in a loop)
     HRESULT hr;
-    while ((hr = c->cap->lpVtbl->GetBuffer(c->cap, &data, &frames, &flags, &pkt_size, NULL)) == AUDCLNT_E_BUFFER_EMPTY) {
+    int tries = 0;
+    while ((hr = IAudioCaptureClient_GetBuffer(c->cap, &data, &frames, &flags, &pkt_size, NULL))
+           == AUDCLNT_E_BUFFER_EMPTY) {
+        if (++tries > 100) return -1;
         Sleep(1);
     }
     if (FAILED(hr)) return -1;
 
-    int max_samples = (int)frames;
-    if (max_samples > n) max_samples = n;
-
-    memcpy(buf, data, (size_t)max_samples * c->channels * sizeof(float));
-    c->cap->lpVtbl->ReleaseBuffer(c->cap, frames);
-    return max_samples;
+    int max_s = (int)frames;
+    if (max_s > n) max_s = n;
+    memcpy(buf, data, (size_t)max_s * c->channels * sizeof(float));
+    IAudioCaptureClient_ReleaseBuffer(c->cap, frames);
+    return max_s;
 }
 
 int wasapi_capture_rate(const wasapi_cap_t *c) { return c ? c->rate : 0; }
@@ -145,19 +144,18 @@ int wasapi_capture_channels(const wasapi_cap_t *c) { return c ? c->channels : 0;
 
 void wasapi_capture_close(wasapi_cap_t *c) {
     if (!c) return;
-    if (c->cap) c->cap->lpVtbl->Release(c->cap);
-    if (c->client) c->client->lpVtbl->Release(c->client);
+    if (c->cap) IAudioCaptureClient_Release(c->cap);
+    if (c->client) IAudioClient_Release(c->client);
     free(c);
 }
 
 // ==================== RENDER ====================
 
 struct wasapi_render {
-    IAudioClient    *client;
+    IAudioClient *client;
     IAudioRenderClient *rnd;
-    WAVEFORMATEX    *fmt;
-    int             rate;
-    int             channels;
+    int rate;
+    int channels;
 };
 
 wasapi_render_t * wasapi_render_open(const wchar_t *dev_id) {
@@ -169,20 +167,20 @@ wasapi_render_t * wasapi_render_open(const wchar_t *dev_id) {
 
     int rate, chans;
     WAVEFORMATEX *fmt = get_float_format(client, &rate, &chans);
+    if (!fmt) { IAudioClient_Release(client); return NULL; }
 
-    AUDCLNT_STREAMFLAGS flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    HRESULT hr = client->lpVtbl->Initialize(client, AUDCLNT_SHAREMODE_SHARED, flags,
-                                             200000, 0, fmt, NULL);
-    if (FAILED(hr)) { client->lpVtbl->Release(client); return NULL; }
+    HRESULT hr = IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+        200000, 0, fmt, NULL);
+    if (FAILED(hr)) { IAudioClient_Release(client); return NULL; }
 
     IAudioRenderClient *rnd = NULL;
-    hr = client->lpVtbl->GetService(client, &IID_IAudioRenderClient, (void **)&rnd);
-    if (FAILED(hr)) { client->lpVtbl->Release(client); return NULL; }
+    hr = IAudioClient_GetService(client, &IID_IAudioRenderClient, (void **)&rnd);
+    if (FAILED(hr)) { IAudioClient_Release(client); return NULL; }
 
     wasapi_render_t *r = (wasapi_render_t *)calloc(1, sizeof(*r));
     r->client = client;
     r->rnd = rnd;
-    r->fmt = fmt;
     r->rate = rate;
     r->channels = chans;
     return r;
@@ -191,18 +189,15 @@ wasapi_render_t * wasapi_render_open(const wchar_t *dev_id) {
 int wasapi_render_write(wasapi_render_t *r, const float *buf, int n) {
     if (!r || !r->rnd) return -1;
 
-    // Write in chunks if buffer is too small
     int written = 0;
     while (written < n) {
         int chunk = n - written;
         BYTE *data = NULL;
-        HRESULT hr = r->rnd->lpVtbl->GetBuffer(r->rnd, chunk, &data);
-        if (FAILED(hr)) {
-            if (hr == AUDCLNT_E_BUFFER_FULL) { Sleep(1); continue; }
-            return -1;
-        }
+        HRESULT hr = IAudioRenderClient_GetBuffer(r->rnd, (UINT32)chunk, &data);
+        if (hr == AUDCLNT_E_BUFFER_FULL) { Sleep(1); continue; }
+        if (FAILED(hr)) return -1;
         memcpy(data, buf + written, (size_t)chunk * r->channels * sizeof(float));
-        r->rnd->lpVtbl->Write(r->rnd, chunk, 0, data);
+        IAudioRenderClient_ReleaseBuffer(r->rnd, (UINT32)chunk, 0);
         written += chunk;
     }
     return 0;
@@ -213,51 +208,55 @@ int wasapi_render_channels(const wasapi_render_t *r) { return r ? r->channels : 
 
 int wasapi_render_start(wasapi_render_t *r) {
     if (!r) return -1;
-    return (int)r->client->lpVtbl->Start(r->client);
+    return (int)IAudioClient_Start(r->client);
 }
 
 int wasapi_render_stop(wasapi_render_t *r) {
     if (!r) return -1;
-    return (int)r->client->lpVtbl->Stop(r->client);
+    return (int)IAudioClient_Stop(r->client);
 }
 
 void wasapi_render_close(wasapi_render_t *r) {
     if (!r) return;
-    if (r->rnd) r->rnd->lpVtbl->Release(r->rnd);
-    if (r->client) r->client->lpVtbl->Release(r->client);
+    if (r->rnd) IAudioRenderClient_Release(r->rnd);
+    if (r->client) IAudioClient_Release(r->client);
     free(r);
 }
 
 // ==================== ENUMERATION ====================
 
-static int enum_devices(eDataFlow flow, wasapi_dev_t *devs, int max_n) {
+static int enum_devices(EDataFlow flow, wasapi_dev_t *devs, int max_n) {
     IMMDeviceEnumerator *enumr = NULL;
     HRESULT hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
                                   &IID_IMMDeviceEnumerator, (void **)&enumr);
     if (FAILED(hr)) return -1;
 
     IMMDeviceCollection *coll = NULL;
-    hr = enumr->lpVtbl->EnumAudioEndpoints(enumr, flow, DEVICE_STATE_ACTIVE, &coll);
-    if (FAILED(hr)) { enumr->lpVtbl->Release(enumr); return -1; }
+    hr = IMMDeviceEnumerator_EnumAudioEndpoints(enumr, flow, DEVICE_STATE_ACTIVE, &coll);
+    if (FAILED(hr)) { IMMDeviceEnumerator_Release(enumr); return -1; }
 
     UINT count = 0;
-    coll->lpVtbl->GetCount(coll, &count);
+    IMMDeviceCollection_GetCount(coll, &count);
 
     int n = 0;
     for (UINT i = 0; i < count && n < max_n; i++) {
         IMMDevice *dev = NULL;
-        if (FAILED(coll->lpVtbl->Item(coll, i, &dev))) continue;
+        if (FAILED(IMMDeviceCollection_Item(coll, i, &dev))) continue;
 
         PWSTR id_str = NULL;
-        dev->lpVtbl->GetId(dev, &id_str);
+        IMMDevice_GetId(dev, &id_str);
 
         WCHAR friendly[256] = L"(unknown)";
-        PROPVARIANT pv;
-        ZeroMemory(&pv, sizeof(pv));
-        if (SUCCEEDED(dev->lpVtbl->GetProperty(dev, &DEVPKEY_Device_FriendlyName, &pv))) {
-            if (pv.vt == VT_BSTR && pv.val.bstrVal)
-                wcsncpy_s(friendly, 256, pv.val.bstrVal, 255);
-            PropVariantClear(&pv);
+        IPropertyStore *store = NULL;
+        if (SUCCEEDED(dev->lpVtbl->OpenPropertyStore(dev, STGM_READ, (IUnknown **)&store))) {
+            PROPVARIANT pv;
+            ZeroMemory(&pv, sizeof(pv));
+            if (SUCCEEDED(store->lpVtbl->GetValue(store, &DEVPKEY_Device_FriendlyName, &pv))) {
+                if (pv.vt == VT_BSTR && pv.pwszVal)
+                    lstrcpynW(friendly, pv.pwszVal, 256);
+                PropVariantClear(&pv);
+            }
+            store->lpVtbl->Release(store);
         }
 
         if (id_str) {
@@ -268,12 +267,11 @@ static int enum_devices(eDataFlow flow, wasapi_dev_t *devs, int max_n) {
         devs[n].is_default_in = 0;
         devs[n].is_default_out = 0;
         n++;
-
-        dev->lpVtbl->Release(dev);
+        IMMDevice_Release(dev);
     }
 
-    coll->lpVtbl->Release(coll);
-    enumr->lpVtbl->Release(enumr);
+    IMMDeviceCollection_Release(coll);
+    IMMDeviceEnumerator_Release(enumr);
     return n;
 }
 

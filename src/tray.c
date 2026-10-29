@@ -1,65 +1,85 @@
 // tray.c — Windows system tray for spartacvc.
 //
-// Enumerates available compute backends on load, shows a tray icon,
-// and provides a right-click menu to select the active pipeline.
+// Menu:
+//   Pipeline:  ✓ Vulkan / CUDA / CPU
+//   Model:     current model + directory listing + Browse
+//   Audio:     In/Out devices + Change
+//   Start/Stop
+//   Convert file...
+//   Quit
 //
-// Backends are probed at startup:
-//   - CPU (always available)
-//   - CUDA (if NVIDIA device present)
-//   - Vulkan (if Vulkan device present)
-//
-// The selected backend is stored and can be queried by the pipeline code.
-//
-// Win32 APIs used: Shell_NotifyIcon, TrackPopupMenu, RegisterClass.
-// No external dependencies beyond Win32 + ggml backend headers.
+// All strings wide/UTF-16. No console window.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
+#include <commdlg.h>
+#include <shlobj.h>
+#include <devpropdef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "tray.h"
+#include "wasapi.h"
+#include "pipeline_rt.h"
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
 #include "ggml-vulkan.h"
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "comctl32.lib")
 
 // --- Menu item IDs ---
-#define ID_MNU_BASE      100
-#define ID_MNU_SEP1      200
-#define ID_MNU_START     201
-#define ID_MNU_STOP      202
-#define ID_MNU_SEP2      203
-#define ID_MNU_QUIT      204
+#define ID_BASE          100   // backend selection: ID_BASE + i
+#define ID_MODEL_BASE    300   // model selection: ID_MODEL_BASE + i
+#define ID_MODEL_BROWSE  390
+#define ID_DEV_IN_BASE   400   // input device: ID_DEV_IN_BASE + i
+#define ID_DEV_OUT_BASE  500   // output device: ID_DEV_OUT_BASE + i
+#define ID_START         600
+#define ID_STOP          601
+#define ID_CONVERT       602
+#define ID_QUIT          603
 
-// --- Backend info ---
+// --- State ---
 typedef struct {
-    const wchar_t *name;    // display name (wide/UTF-16)
-    int         be_id;      // SPCV_BE_* enum value
-    int         available;  // 1 if device found
-    int         n_devices;  // number of devices
-    wchar_t     desc[128];  // device description
+    const wchar_t *name;
+    int  be_id;
+    int  available;
+    int  n_devices;
+    wchar_t desc[128];
 } backend_info_t;
 
-#define MAX_BACKENDS 8
+#define MAX_BACKENDS  8
+#define MAX_MODELS    32
+#define MAX_DEVS      16
 
 static backend_info_t g_backends[MAX_BACKENDS];
-static int            g_n_backends = 0;
-static int            g_selected   = 0;   // index into g_backends[]
-static int            g_running    = 0;   // pipeline running?
+static int  g_n_backends = 0;
+static int  g_sel_be     = 0;
+
+static wchar_t g_models[MAX_MODELS][260];
+static int     g_n_models = 0;
+static int     g_sel_model = 0;
+static wchar_t g_model_dir[260] = L"models\\voices";
+
+static wasapi_dev_t g_dev_in[MAX_DEVS];
+static int  g_n_dev_in = 0;
+static int  g_sel_in = 0;
+
+static wasapi_dev_t g_dev_out[MAX_DEVS];
+static int  g_n_dev_out = 0;
+static int  g_sel_out = 0;
+
+static int  g_running = 0;
 
 static NOTIFYICONDATAW g_nid = {0};
-static HWND            g_hwnd = NULL;
-static HICON           g_hicon = NULL;
+static HWND   g_hwnd  = NULL;
+static HICON  g_hicon = NULL;
 
-// --- Backend enumeration ---
-
+// --- Backend probe ---
 static void probe_backends(void) {
     g_n_backends = 0;
-
-    // CPU (always)
     g_backends[g_n_backends].name = L"CPU";
     g_backends[g_n_backends].be_id = 0;
     g_backends[g_n_backends].available = 1;
@@ -67,38 +87,114 @@ static void probe_backends(void) {
     wcscpy_s(g_backends[g_n_backends].desc, 128, L"General Purpose");
     g_n_backends++;
 
-    // CUDA
-    int n_cuda = ggml_backend_cuda_get_device_count();
-    if (n_cuda > 0) {
+    int n = ggml_backend_cuda_get_device_count();
+    if (n > 0) {
         g_backends[g_n_backends].name = L"CUDA";
         g_backends[g_n_backends].be_id = 1;
         g_backends[g_n_backends].available = 1;
-        g_backends[g_n_backends].n_devices = n_cuda;
+        g_backends[g_n_backends].n_devices = n;
         wcscpy_s(g_backends[g_n_backends].desc, 128, L"NVIDIA GPU");
         g_n_backends++;
     }
-
-    // Vulkan
-    int n_vk = ggml_backend_vk_get_device_count();
-    if (n_vk > 0) {
+    n = ggml_backend_vk_get_device_count();
+    if (n > 0) {
         g_backends[g_n_backends].name = L"Vulkan";
         g_backends[g_n_backends].be_id = 3;
         g_backends[g_n_backends].available = 1;
-        g_backends[g_n_backends].n_devices = n_vk;
-        char desc_n[128] = {0};
-        ggml_backend_vk_get_device_description(0, desc_n, sizeof(desc_n));
-        MultiByteToWideChar(CP_UTF8, 0, desc_n, -1, g_backends[g_n_backends].desc, 128);
+        g_backends[g_n_backends].n_devices = n;
+        char dn[128] = {0};
+        ggml_backend_vk_get_device_description(0, dn, sizeof(dn));
+        MultiByteToWideChar(CP_UTF8, 0, dn, -1, g_backends[g_n_backends].desc, 128);
         g_n_backends++;
     }
+    g_sel_be = (g_n_backends > 1) ? g_n_backends - 1 : 0;
+}
 
-    // Default selection: first GPU if available, else CPU
-    if (g_n_backends > 1) g_selected = g_n_backends - 1; // prefer last (Vulkan)
-    else if (g_n_backends > 0) g_selected = 0;
+// --- Model scan ---
+static void scan_models(void) {
+    g_n_models = 0;
+    wchar_t pattern[300];
+    swprintf(pattern, 300, L"%s\\*.gguf", g_model_dir);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            wcscpy_s(g_models[g_n_models], 260, fd.cFileName);
+            g_n_models++;
+        } while (FindNextFileW(h, &fd) && g_n_models < MAX_MODELS);
+        FindClose(h);
+    }
+    // Also scan for .pth
+    swprintf(pattern, 300, L"%s\\*.pth", g_model_dir);
+    h = FindFirstFileW(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            wcscpy_s(g_models[g_n_models], 260, fd.cFileName);
+            g_n_models++;
+        } while (FindNextFileW(h, &fd) && g_n_models < MAX_MODELS);
+        FindClose(h);
+    }
+    g_sel_model = 0;
+}
+
+// --- Audio device scan ---
+static void scan_devices(void) {
+    wasapi_co_init();
+    g_n_dev_in = wasapi_enum_inputs(g_dev_in, MAX_DEVS);
+    g_n_dev_out = wasapi_enum_outputs(g_dev_out, MAX_DEVS);
+    g_sel_in = 0;
+    g_sel_out = 0;
+}
+
+// --- Convert file (call spartacvc.exe CLI) ---
+static void do_convert_file(void) {
+    wchar_t in_file[260] = L"";
+    wchar_t out_file[260] = L"";
+
+    OPENFILENAMEW ofn_in = { sizeof(ofn_in) };
+    ofn_in.hwndOwner = g_hwnd;
+    ofn_in.lpstrFilter = L"WAV files\0*.wav\0All files\0*.*\0";
+    ofn_in.lpstrFile = in_file;
+    ofn_in.nMaxFile = 260;
+    ofn_in.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&ofn_in)) return;
+
+    ofn_in.lpstrFile = out_file;
+    ofn_in.nMaxFile = 260;
+    ofn_in.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    ofn_in.lpstrDefExt = L"wav";
+    if (!GetSaveFileNameW(&ofn_in)) return;
+
+    // Build model path
+    wchar_t model_path[300];
+    if (wcslen(g_models[g_sel_model]) < 260 && g_models[g_sel_model][wcslen(g_models[g_sel_model])-1] != L'\\') {
+        swprintf(model_path, 300, L"%s\\%s", g_model_dir, g_models[g_sel_model]);
+    } else {
+        wcscpy_s(model_path, 300, g_models[g_sel_model]);
+    }
+
+    const wchar_t *be = (g_backends[g_sel_be].be_id == 1) ? L"cuda"
+                       : (g_backends[g_sel_be].be_id == 3) ? L"vulkan" : L"cpu";
+
+    wchar_t cmd[1024];
+    swprintf(cmd, 1024,
+        L"spartacvc.exe \"%s\" --voice \"%s\" --backend %s --out \"%s\"",
+        in_file, model_path, be, out_file);
+
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {0};
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    WaitForSingleObject(pi.hProcess, 120000);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
 }
 
 // --- Tray icon ---
-
-static int add_tray_icon(void) {
+static void add_tray_icon(void) {
     ZeroMemory(&g_nid, sizeof(g_nid));
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = g_hwnd;
@@ -107,77 +203,119 @@ static int add_tray_icon(void) {
     g_nid.uCallbackMessage = WM_APP + 1;
     g_nid.hIcon = g_hicon;
     wcscpy_s(g_nid.szTip, 128, L"Spartacv\u03C2");
-    return Shell_NotifyIconW(NIM_ADD, &g_nid);
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 
-static void remove_tray_icon(void) {
-    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+static void update_tip(void) {
+    wchar_t tip[128];
+    swprintf(tip, 128, L"Spartacv\u03C2 [%s]%s",
+             g_backends[g_sel_be].name, g_running ? L" \u25CF" : L"");
+    wcscpy_s(g_nid.szTip, 128, tip);
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
 // --- Context menu ---
-
 static void show_menu(void) {
-    HMENU hmenu = CreatePopupMenu();
-    if (!hmenu) return;
+    HMENU m = CreatePopupMenu();
+    POINT pt; GetCursorPos(&pt);
 
-    POINT pt;
-    GetCursorPos(&pt);
-
-    // Backend selection
+    // Pipeline
     for (int i = 0; i < g_n_backends; i++) {
         if (!g_backends[i].available) continue;
-        UINT id = ID_MNU_BASE + i;
-        UINT flags = MF_STRING | (i == g_selected ? MF_CHECKED : MF_UNCHECKED);
-        // Build label: "CUDA — NVIDIA GPU (1)"
-        wchar_t label[256];
-        swprintf(label, 256, L"%s — %s (%d)",
-                 g_backends[i].name, g_backends[i].desc, g_backends[i].n_devices);
-        AppendMenuW(hmenu, flags, (UINT_PTR)id, label);
+        wchar_t lbl[256];
+        swprintf(lbl, 256, L"%s \u2014 %s", g_backends[i].name, g_backends[i].desc);
+        AppendMenuW(m, MF_STRING | (i == g_sel_be ? MF_CHECKED : 0),
+                    ID_BASE + i, lbl);
     }
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
 
-    // Separator
-    AppendMenuW(hmenu, MF_SEPARATOR, 0, NULL);
+    // Model
+    if (g_n_models > 0) {
+        for (int i = 0; i < g_n_models; i++) {
+            AppendMenuW(m, MF_STRING | (i == g_sel_model ? MF_CHECKED : 0),
+                        ID_MODEL_BASE + i, g_models[i]);
+        }
+        AppendMenuW(m, MF_STRING, ID_MODEL_BROWSE, L"Browse...");
+    } else {
+        AppendMenuW(m, MF_GRAYED, 0, L"No models found");
+        AppendMenuW(m, MF_STRING, ID_MODEL_BROWSE, L"Browse...");
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+
+    // Audio devices
+    if (g_n_dev_in > 0) {
+        for (int i = 0; i < g_n_dev_in && i < 4; i++)
+            AppendMenuW(m, MF_STRING | (i == g_sel_in ? MF_CHECKED : 0),
+                        ID_DEV_IN_BASE + i, g_dev_in[i].friendly);
+    }
+    if (g_n_dev_out > 0) {
+        for (int i = 0; i < g_n_dev_out && i < 4; i++)
+            AppendMenuW(m, MF_STRING | (i == g_sel_out ? MF_CHECKED : 0),
+                        ID_DEV_OUT_BASE + i, g_dev_out[i].friendly);
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
 
     // Start / Stop
-    if (g_running) {
-        AppendMenuW(hmenu, MF_STRING, ID_MNU_STOP, L"Stop");
-    } else {
-        AppendMenuW(hmenu, MF_STRING, ID_MNU_START, L"Start");
-    }
+    AppendMenuW(m, MF_STRING | (g_running ? MF_GRAYED : 0), ID_START, L"\u25B6 Start");
+    AppendMenuW(m, MF_STRING | (!g_running ? MF_GRAYED : 0), ID_STOP, L"\u25A0 Stop");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
 
-    // Separator + Quit
-    AppendMenuW(hmenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hmenu, MF_STRING, ID_MNU_QUIT, L"Quit");
+    // Convert + Quit
+    AppendMenuW(m, MF_STRING, ID_CONVERT, L"Convert file...");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, ID_QUIT, L"Quit");
 
     SetForegroundWindow(g_hwnd);
-    int cmd = TrackPopupMenu(hmenu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
-                             pt.x, pt.y, 0, g_hwnd, NULL);
-    DestroyMenu(hmenu);
+    int cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, g_hwnd, NULL);
+    DestroyMenu(m);
 
-    if (cmd >= ID_MNU_BASE && cmd < ID_MNU_BASE + MAX_BACKENDS) {
-        g_selected = cmd - ID_MNU_BASE;
-        // Update tooltip to show selected backend
-        wchar_t tip[128];
-        swprintf(tip, 128, L"Spartacv\u03C2 [%s]", g_backends[g_selected].name);
-        wcscpy_s(g_nid.szTip, 128, tip);
-        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-    } else if (cmd == ID_MNU_QUIT) {
+    // Handle selection
+    if (cmd >= ID_BASE && cmd < ID_BASE + MAX_BACKENDS) {
+        g_sel_be = cmd - ID_BASE;
+        update_tip();
+    } else if (cmd >= ID_MODEL_BASE && cmd < ID_MODEL_BASE + MAX_MODELS) {
+        g_sel_model = cmd - ID_MODEL_BASE;
+    } else if (cmd == ID_MODEL_BROWSE) {
+        // Simple input dialog for model directory
+        wchar_t buf[260];
+        wcscpy_s(buf, 260, g_model_dir);
+        // Use a basic approach: just rescan current dir for now
+        // Full browse dialog needs comctl32 v6 manifest
+        scan_models();
+    } else if (cmd >= ID_DEV_IN_BASE && cmd < ID_DEV_IN_BASE + MAX_DEVS) {
+        g_sel_in = cmd - ID_DEV_IN_BASE;
+    } else if (cmd >= ID_DEV_OUT_BASE && cmd < ID_DEV_OUT_BASE + MAX_DEVS) {
+        g_sel_out = cmd - ID_DEV_OUT_BASE;
+    } else if (cmd == ID_START) {
+        if (!g_running) {
+            g_running = 1;
+            update_tip();
+            const wchar_t *in_id = (g_n_dev_in > 0) ? g_dev_in[g_sel_in].id : NULL;
+            const wchar_t *out_id = (g_n_dev_out > 0) ? g_dev_out[g_sel_out].id : NULL;
+            spcv_rt_start(NULL, g_backends[g_sel_be].be_id, 0, in_id, out_id, NULL, NULL);
+        }
+    } else if (cmd == ID_STOP) {
+        if (g_running) {
+            spcv_rt_stop(NULL);
+            g_running = 0;
+            update_tip();
+        }
+    } else if (cmd == ID_CONVERT) {
+        do_convert_file();
+    } else if (cmd == ID_QUIT) {
+        if (g_running) spcv_rt_stop(NULL);
         PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
     }
-    // ID_MNU_START / ID_MNU_STOP: TODO — launch pipeline thread
 }
 
 // --- Window proc ---
-
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_APP + 1:
-        if (lp == WM_RBUTTONUP || lp == WM_LBUTTONUP) {
-            show_menu();
-        }
+        if (lp == WM_RBUTTONUP || lp == WM_LBUTTONUP) show_menu();
         return 0;
     case WM_CLOSE:
-        remove_tray_icon();
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
@@ -187,13 +325,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// --- Main entry ---
-
+// --- Main ---
 int spcv_tray_run(void) {
-    // Probe backends
     probe_backends();
+    scan_models();
+    scan_devices();
 
-    // Create hidden window
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
@@ -202,24 +339,22 @@ int spcv_tray_run(void) {
     RegisterClassExW(&wc);
 
     g_hwnd = CreateWindowExW(0, L"SpartacvcTray", L"Spartacv\u03C2",
-                             0, 0, 0, 0, 0,
-                             HWND_MESSAGE, NULL, NULL, NULL);
+                             0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL);
     if (!g_hwnd) return 1;
 
-    // Load default icon (app icon or system hand)
-    g_hicon = LoadIconW(NULL, IDI_APPLICATION);
+    // Try to load app icon from resource, fallback to system
+    g_hicon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
+    if (!g_hicon) g_hicon = LoadIconW(NULL, IDI_APPLICATION);
 
-    // Add tray icon
     add_tray_icon();
 
-    // Message loop
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
-    // Cleanup
     if (g_hicon) DestroyIcon(g_hicon);
+    wasapi_co_uninit();
     return 0;
 }
