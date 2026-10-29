@@ -12,15 +12,16 @@ Kokoro: the TTS brings the emotion and pacing, Spartacvς brings the voice.
 Every existing RVC runtime is a Python stack (torch + fairseq + faiss), which on
 Windows means source-building abandoned libraries or running Docker. The models
 themselves are just neural nets — they run fine as ONNX graphs. Spartacvς executes
-them with the ONNX Runtime C API and nothing else:
+them with **ggml** (the tensor library from llama.cpp) — a single C library
+with pluggable GPU backends:
 
 | Concern        | Answer                                                        |
 | -------------- | ------------------------------------------------------------- |
-| GPU (Windows)  | **DirectML** — any DirectX 12 GPU, old or new                 |
-| GPU (NVIDIA)   | CUDA execution provider (when available)                      |
-| No GPU         | CPU fallback — always works, slower                           |
-| Backend choice | Auto-detected at startup, override in config                  |
-| Language       | C (portable core) + platform audio backends (WASAPI first)    |
+| GPU (NVIDIA)   | **CUDA** backend (ggml-cuda)                                  |
+| GPU (AMD/any)  | **Vulkan** backend (ggml-vulkan) — any Vulkan 1.2+ GPU        |
+| No GPU         | **CPU** fallback (ggml-cpu) — always works                    |
+| Backend choice | Auto-detected at startup, override in tray menu or CLI        |
+| Language       | Pure C runtime + WASAPI audio + Win32 tray                    |
 
 ## Modes
 
@@ -46,29 +47,43 @@ or through the window.
 - Device picker for input and output (Windows: WASAPI enumeration)
 - System tray with start/stop, no console window in normal use
 
-## Repository layout (planned)
+## Repository layout
 
 ```
 $spartacvc/
-├── CMakeLists.txt
-├── LICENSE                  # Apache-2.0
 ├── README.md
 ├── ROADMAP.md
-├── config.example.json
+├── PROMPT.md                # master project brief
+├── AGENTS.md                # agent rules
+├── build_spcv.bat           # build CLI (spartacvc.exe)
+├── build_tray.bat           # build tray app (spartacvc_tray.exe)
+├── models/
+│   ├── base/                # HuBERT + RMVPE (.onnx)
+│   └── voices/              # voice models (.gguf / .pth)
 ├── src/
-│   ├── main.c               # entry: CLI or GUI
-│   ├── core/                # portable C: pipeline, config, model loading
-│   ├── audio/               # resample, rms, mix, wav i/o
-│   ├── backends/
-│   │   ├── ort.c            # ONNX Runtime C API wrapper
-│   │   └── ep.c             # execution-provider selection (DirectML/CUDA/CPU)
-│   ├── platform/
-│   │   ├── win/             # WASAPI capture/render, Win32 UI, tray
-│   │   └── unix/            # ALSA/Pulse (later)
-│   └── ui/                  # config window (Win32)
+│   ├── main.c               # CLI entry point
+│   ├── tray.c               # Win32 system tray app
+│   ├── tray_main.c          # WinMain entry
+│   ├── wasapi.c             # WASAPI capture/render + device enum
+│   ├── pipeline_rt.c        # real-time worker thread
+│   ├── ggml_pipeline.c      # RVC flow+decoder on GPU (ggml)
+│   ├── ggml_rvc_enc_gpu.c   # RVC encoder on GPU (ggml)
+│   ├── gguf_load.c          # GGUF → ggml tensor loading
+│   ├── rvc.c                # RVC model config
+│   ├── onnx.c               # ONNX Runtime wrapper (HuBERT, RMVPE)
+│   ├── mel.c                # mel spectrogram
+│   ├── f0.c                 # f0 extraction
+│   ├── faiss_index.c        # FAISS retrieval index
+│   ├── pth_loader.c         # .pth model loading
+│   ├── pth2gguf.c           # .pth → GGUF converter
+│   ├── com_guids.c          # manual COM GUID definitions
+│   └── ...
 ├── tools/
-│   └── download_models.md   # where to get models + how to add your own
-└── third_party/             # onnxruntime (fetched via CMake, not vendored)
+│   ├── stt.py               # STT for "listening" to output
+│   ├── spectrogram.py       # spectrogram generation
+│   └── download_models.md   # where to get models
+└── third_party/
+    └── onnxruntime/         # ONNX Runtime C API (for HuBERT/RMVPE)
 ```
 
 ## Getting models
