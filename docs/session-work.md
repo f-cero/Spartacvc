@@ -169,14 +169,14 @@ Session: 2026-10-06T23:17:52Z → 2026-10-17T01:17:48Z
 - `src/tray.c` — Win32 tray icon, full menu (backend/model/devices/convert/start-stop/quit)
 - `src/tray_main.c` — WinMain entry point
 - `src/wasapi.h/.c` — WASAPI capture/render + device enumeration (COM in C, vtable calls)
-- `src/pipeline_rt.h/.c` — real-time worker thread (pass-through placeholder)
+- `src/pipeline_rt.h/.c` — real-time worker (batch RVC via CLI, ~2-3s latency)
 - `src/com_guids.c` — manual COM GUID definitions (SDK lib doesn't export them)
 - `src/spartacvc.ico` — placeholder icon (S on dark bg)
 - `src/spartacvc.res` — compiled icon resource (276KB)
 - `build_tray.bat` — builds `spartacvc_tray.exe` (203MB static)
 - **All strings wide/UTF-16** for international release
-- **WORKING:** backend selection, model listing, device enumeration, Convert file (via CLI), Start/Stop (pass-through)
-- **NOT YET:** true real-time RVC in rt_worker (currently identity pass-through)
+- **WORKING:** backend selection, model listing, device enumeration, Convert file (via CLI), Start/Stop (batch RVC), config persistence
+- **NOT YET:** true real-time RVC (needs pipeline linked directly, not CLI round-trip)
 
 ### Tray App Bugs Fixed (Oct 29)
 - `eDataFlow` → `EDataFlow` (capital E in SDK)
@@ -192,12 +192,12 @@ Session: 2026-10-06T23:17:52Z → 2026-10-17T01:17:48Z
 - rt_worker output buffer was `chunk_samples * 480` (way too big) → `chunk_samples`
 
 ### What's Next
-1. **True real-time RVC** — link pipeline code into tray app, replace pass-through
+1. **True real-time RVC** — link pipeline code into tray app (refactor ggml for model reuse)
 2. **Model directory browse** — proper folder picker (needs comctl32 v6 manifest)
-3. **Model history** — remember last N models used
-4. **Virtual mic** — output to VB-Cable or WASAPI virtual device
-5. **Config persistence** — save backend/model/device selection to config.json
-6. **Icon** — replace placeholder with proper design
+3. **Virtual mic** — output to VB-Cable or WASAPI virtual device
+4. **Icon** — replace placeholder with proper design
+5. **i18n** — string table for multiple languages (all strings already wide/UTF-16)
+6. **Auto-start** — optionally launch on Windows logon
 
 ### Key Files
 | File | Purpose |
