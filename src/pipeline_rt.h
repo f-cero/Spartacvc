@@ -20,7 +20,8 @@ extern "C" {
  *  @return              Thread handle, or NULL on failure. */
 void * spcv_rt_start(const wchar_t *model_path, int be_id, int gpu_id,
                      const wchar_t *in_dev, const wchar_t *out_dev,
-                     const wchar_t *hubert_path, const wchar_t *rmvpe_path);
+                     const wchar_t *hubert_path, const wchar_t *rmvpe_path,
+                     int pitch_semitones);
 
 /** Stop the real-time pipeline and wait for the thread to exit. */
 void spcv_rt_stop(void *thread);

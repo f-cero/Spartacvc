@@ -36,6 +36,7 @@
 #define ID_MODEL_BROWSE  390
 #define ID_DEV_IN_BASE   400   // input device: ID_DEV_IN_BASE + i
 #define ID_DEV_OUT_BASE  500   // output device: ID_DEV_OUT_BASE + i
+#define ID_PITCH_BASE    200   // pitch: ID_PITCH_BASE + (semitones + 12), range -12..+12
 #define ID_START         600
 #define ID_STOP          601
 #define ID_CONVERT       602
@@ -72,6 +73,7 @@ static int  g_n_dev_out = 0;
 static int  g_sel_out = 0;
 
 static int  g_running = 0;
+static int  g_pitch    = 0;   // semitones, -12..+12
 
 static void save_config(void);
 
@@ -196,8 +198,8 @@ static void do_convert_file(void) {
 
     wchar_t cmd[2048];
     swprintf(cmd, 2048,
-        L"\"%s\" \"%s\" --voice \"%s\" --hubert \"%s\" --rmvpe \"%s\" --backend %s --out \"%s\"",
-        cli_path, in_file, model_path, hubert, rmvpe, be, out_file);
+        L"\"%s\" \"%s\" --voice \"%s\" --hubert \"%s\" --rmvpe \"%s\" --backend %s --pitch %d --out \"%s\"",
+        cli_path, in_file, model_path, hubert, rmvpe, be, g_pitch, out_file);
 
     // Show progress
     MessageBoxW(g_hwnd, L"Converting...\nThis may take a minute.", L"Spartacv\u03C2", MB_OK);
@@ -287,6 +289,17 @@ static void show_menu(void) {
     }
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
 
+    // Pitch shift
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    for (int s = -12; s <= 12; s++) {
+        wchar_t lbl[32];
+        if (s == 0) swprintf(lbl, 32, L"Pitch: 0");
+        else if (s > 0) swprintf(lbl, 32, L"Pitch: +%d", s);
+        else swprintf(lbl, 32, L"Pitch: %d", s);
+        AppendMenuW(m, MF_STRING | (s == g_pitch ? MF_CHECKED : 0),
+                    ID_PITCH_BASE + (s + 12), lbl);
+    }
+
     // Start / Stop
     AppendMenuW(m, MF_STRING | (g_running ? MF_GRAYED : 0), ID_START, L"\u25B6 Start");
     AppendMenuW(m, MF_STRING | (!g_running ? MF_GRAYED : 0), ID_STOP, L"\u25A0 Stop");
@@ -316,6 +329,11 @@ static void show_menu(void) {
         // Use a basic approach: just rescan current dir for now
         // Full browse dialog needs comctl32 v6 manifest
         scan_models();
+    } else if (cmd >= ID_PITCH_BASE && cmd < ID_PITCH_BASE + 25) {
+        g_pitch = cmd - ID_PITCH_BASE - 12;
+        if (g_pitch < -12) g_pitch = -12;
+        if (g_pitch > 12) g_pitch = 12;
+        save_config();
     } else if (cmd >= ID_DEV_IN_BASE && cmd < ID_DEV_IN_BASE + MAX_DEVS) {
         g_sel_in = cmd - ID_DEV_IN_BASE;
         save_config();
@@ -346,7 +364,7 @@ static void show_menu(void) {
             swprintf(rmvpe, 300, L"%smodels\base\rmvpe.onnx", exe_dir);
 
             spcv_rt_start(model_path, g_backends[g_sel_be].be_id, 0,
-                          in_id, out_id, hubert, rmvpe);
+                          in_id, out_id, hubert, rmvpe, g_pitch);
         }
     } else if (cmd == ID_STOP) {
         if (g_running) {
@@ -398,6 +416,7 @@ static void save_config(void) {
     fwprintf(f, L"model_dir=%s\n", g_model_dir);
     fwprintf(f, L"dev_in=%d\n", g_sel_in);
     fwprintf(f, L"dev_out=%d\n", g_sel_out);
+    fwprintf(f, L"pitch=%d\n", g_pitch);
     fclose(f);
 }
 
@@ -428,6 +447,9 @@ static void load_config(void) {
         } else if (wcsncmp(line, L"dev_out=", 8) == 0) {
             int v = wcstol(line + 8, NULL, 10);
             if (v >= 0 && v < g_n_dev_out) g_sel_out = v;
+        } else if (wcsncmp(line, L"pitch=", 6) == 0) {
+            int v = wcstol(line + 6, NULL, 10);
+            if (v >= -12 && v <= 12) g_pitch = v;
         }
     }
     fclose(f);
