@@ -27,6 +27,7 @@ static wchar_t g_in_dev[260]  = L"";
 static wchar_t g_out_dev[260] = L"";
 static wchar_t g_exe_dir[260] = L"";
 static int     g_be_id        = 0;
+static int     g_pitch        = 0;
 
 // --- WAV I/O helpers (16-bit PCM mono) ---
 
@@ -172,8 +173,8 @@ static DWORD WINAPI rt_worker(LPVOID arg) {
                 swprintf(cli, 300, L"%sspartacvc.exe", g_exe_dir);
                 wchar_t cmd[2048];
                 swprintf(cmd, 2048,
-                    L"\"%s\" \"%s\" --voice \"%s\" --hubert \"%s\" --rmvpe \"%s\" --backend %s --out \"%s\"",
-                    cli, in_path, g_model, g_hubert, g_rmvpe, be_str, out_path);
+                    L"\"%s\" \"%s\" --voice \"%s\" --hubert \"%s\" --rmvpe \"%s\" --backend %s --pitch %d --out \"%s\"",
+                    cli, in_path, g_model, g_hubert, g_rmvpe, be_str, g_pitch, out_path);
 
                 STARTUPINFOW si = { sizeof(si) };
                 PROCESS_INFORMATION pi = {0};
@@ -238,8 +239,10 @@ static DWORD WINAPI rt_worker(LPVOID arg) {
 
 void * spcv_rt_start(const wchar_t *model_path, int be_id, int gpu_id,
                      const wchar_t *in_dev, const wchar_t *out_dev,
-                     const wchar_t *hubert_path, const wchar_t *rmvpe_path) {
+                     const wchar_t *hubert_path, const wchar_t *rmvpe_path,
+                     int pitch_semitones) {
     (void)gpu_id;
+    g_pitch = pitch_semitones;
 
     if (g_running) return g_thread;
 
