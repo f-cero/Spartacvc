@@ -66,3 +66,4 @@ test_minimal.onnx
 tools/onnx_*.json
 tools/*.c
 tools/__pycache__/
+scratch/icon_test.*

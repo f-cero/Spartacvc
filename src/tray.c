@@ -34,8 +34,14 @@
 #define ID_BASE          100   // backend selection: ID_BASE + i
 #define ID_MODEL_BASE    300   // model selection: ID_MODEL_BASE + i
 #define ID_MODEL_BROWSE  390
+#define ID_MODEL_CONVERT 391   // Convert models... dialog
+#define ID_MODEL_RESIDENT 392  // toggle resident in VRAM
+#define ID_MODEL_UNLOAD   393  // unload model
 #define ID_DEV_IN_BASE   400   // input device: ID_DEV_IN_BASE + i
 #define ID_DEV_OUT_BASE  500   // output device: ID_DEV_OUT_BASE + i
+#define ID_DEV_INSTALL   590   // install virtual device
+#define ID_DEV_UNINSTALL 591   // uninstall virtual device
+#define ID_DEV_RENAME    592   // rename devices...
 #define ID_PITCH_BASE    200   // pitch: ID_PITCH_BASE + (semitones + 12), range -12..+12
 #define ID_START         600
 #define ID_STOP          601
@@ -75,11 +81,18 @@ static int  g_sel_out = 0;
 static int  g_running = 0;
 static int  g_pitch    = 0;   // semitones, -12..+12
 
+// Model load state (drives tray icon)
+typedef enum { MODEL_UNLOADED, MODEL_LOADING, MODEL_LOADED } model_state_t;
+static model_state_t g_model_state = MODEL_UNLOADED;
+static int  g_resident = 1;    // 1=keep in VRAM, 0=on-demand
+
 static void save_config(void);
 
 static NOTIFYICONDATAW g_nid = {0};
 static HWND   g_hwnd  = NULL;
-static HICON  g_hicon = NULL;
+static HICON  g_hicon_loaded   = NULL;
+static HICON  g_hicon_loading  = NULL;
+static HICON  g_hicon_unloaded = NULL;
 
 // --- Backend probe ---
 static void probe_backends(void) {
@@ -235,15 +248,50 @@ static void add_tray_icon(void) {
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_APP + 1;
-    g_nid.hIcon = g_hicon;
+    // Icon set by current model state (default: unloaded)
+    g_nid.hIcon = g_hicon_unloaded ? g_hicon_unloaded : g_hicon_loaded;
     wcscpy_s(g_nid.szTip, 128, L"Spartacv\u03C2");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 
+// --- Model state → tray icon ---
+static void update_tip(void);
+static void set_model_state(model_state_t st) {
+    g_model_state = st;
+    HICON ic = NULL;
+    switch (st) {
+    case MODEL_LOADED:   ic = g_hicon_loaded;   break;
+    case MODEL_LOADING:  ic = g_hicon_loading;  break;
+    case MODEL_UNLOADED: ic = g_hicon_unloaded; break;
+    }
+    if (ic) {
+        g_nid.hIcon = ic;
+        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    }
+    update_tip();
+}
+
 static void update_tip(void) {
     wchar_t tip[128];
-    swprintf(tip, 128, L"Spartacv\u03C2 [%s]%s",
-             g_backends[g_sel_be].name, g_running ? L" \u25CF" : L"");
+    const wchar_t *model_name = (g_n_models > 0) ? g_models[g_sel_model] : L"none";
+    const wchar_t *slash = wcsrchr(model_name, L'\\');
+    if (slash) model_name = slash + 1;
+    wchar_t mname[64];
+    wcscpy_s(mname, 64, model_name);
+    wchar_t *dot = wcsrchr(mname, L'.');
+    if (dot) *dot = 0;
+
+    const wchar_t *state = (g_model_state == MODEL_LOADED)   ? L""
+                       : (g_model_state == MODEL_LOADING)  ? L" (loading\u2026)"
+                       : L" (no model)";
+    if (g_pitch != 0)
+        swprintf(tip, 128, L"Spartacv\u03C2 [%s] %s%s %+d%s",
+                 g_backends[g_sel_be].name, mname, state, g_pitch,
+                 g_running ? L" \u25CF" : L"");
+    else
+        swprintf(tip, 128, L"Spartacv\u03C2 [%s] %s%s%s",
+                 g_backends[g_sel_be].name, mname, state,
+                 g_running ? L" \u25CF" : L"");
     wcscpy_s(g_nid.szTip, 128, tip);
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
@@ -253,65 +301,102 @@ static void show_menu(void) {
     HMENU m = CreatePopupMenu();
     POINT pt; GetCursorPos(&pt);
 
-    // Pipeline
-    for (int i = 0; i < g_n_backends; i++) {
-        if (!g_backends[i].available) continue;
-        wchar_t lbl[256];
-        swprintf(lbl, 256, L"%s \u2014 %s", g_backends[i].name, g_backends[i].desc);
-        AppendMenuW(m, MF_STRING | (i == g_sel_be ? MF_CHECKED : 0),
-                    ID_BASE + i, lbl);
-    }
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-
-    // Model
-    if (g_n_models > 0) {
-        for (int i = 0; i < g_n_models; i++) {
-            AppendMenuW(m, MF_STRING | (i == g_sel_model ? MF_CHECKED : 0),
-                        ID_MODEL_BASE + i, g_models[i]);
+    // ---- Model submenu ----
+    {
+        HMENU sub = CreatePopupMenu();
+        if (g_n_models > 0) {
+            for (int i = 0; i < g_n_models; i++)
+                AppendMenuW(sub, MF_STRING | (i == g_sel_model ? MF_CHECKED : 0),
+                            ID_MODEL_BASE + i, g_models[i]);
+        } else {
+            AppendMenuW(sub, MF_GRAYED, 0, L"No models found");
         }
-        AppendMenuW(m, MF_STRING, ID_MODEL_BROWSE, L"Browse...");
-    } else {
-        AppendMenuW(m, MF_GRAYED, 0, L"No models found");
-        AppendMenuW(m, MF_STRING, ID_MODEL_BROWSE, L"Browse...");
-    }
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-
-    // Audio devices
-    if (g_n_dev_in > 0) {
-        for (int i = 0; i < g_n_dev_in && i < 4; i++)
-            AppendMenuW(m, MF_STRING | (i == g_sel_in ? MF_CHECKED : 0),
-                        ID_DEV_IN_BASE + i, g_dev_in[i].friendly);
-    }
-    if (g_n_dev_out > 0) {
-        for (int i = 0; i < g_n_dev_out && i < 4; i++)
-            AppendMenuW(m, MF_STRING | (i == g_sel_out ? MF_CHECKED : 0),
-                        ID_DEV_OUT_BASE + i, g_dev_out[i].friendly);
-    }
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-
-    // Pitch shift
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    for (int s = -12; s <= 12; s++) {
-        wchar_t lbl[32];
-        if (s == 0) swprintf(lbl, 32, L"Pitch: 0");
-        else if (s > 0) swprintf(lbl, 32, L"Pitch: +%d", s);
-        else swprintf(lbl, 32, L"Pitch: %d", s);
-        AppendMenuW(m, MF_STRING | (s == g_pitch ? MF_CHECKED : 0),
-                    ID_PITCH_BASE + (s + 12), lbl);
+        AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(sub, MF_STRING, ID_MODEL_CONVERT,  L"Convert models\u2026");
+        AppendMenuW(sub, MF_STRING | (g_resident ? MF_CHECKED : 0),
+                    ID_MODEL_RESIDENT, L"Resident in VRAM");
+        AppendMenuW(sub, MF_STRING | (g_model_state == MODEL_UNLOADED ? MF_GRAYED : 0),
+                    ID_MODEL_UNLOAD,   L"Unload model");
+        wchar_t model_title[80];
+        const wchar_t *mn = (g_n_models > 0) ? g_models[g_sel_model] : L"none";
+        const wchar_t *ms = wcsrchr(mn, L'\\'); if (ms) mn = ms + 1;
+        wchar_t mbase[64]; wcscpy_s(mbase, 64, mn);
+        wchar_t *mdot = wcsrchr(mbase, L'.'); if (mdot) *mdot = 0;
+        swprintf(model_title, 80, L"Model: %s", mbase);
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, model_title);
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     }
 
-    // Start / Stop
+    // ---- Pitch submenu ----
+    {
+        HMENU sub = CreatePopupMenu();
+        for (int s = -12; s <= 12; s++) {
+            wchar_t lbl[24];
+            if (s == 0)      swprintf(lbl, 24, L"0");
+            else if (s > 0)  swprintf(lbl, 24, L"+%d", s);
+            else             swprintf(lbl, 24, L"%d", s);
+            AppendMenuW(sub, MF_STRING | (s == g_pitch ? MF_CHECKED : 0),
+                        ID_PITCH_BASE + (s + 12), lbl);
+        }
+        wchar_t pitch_title[32];
+        if (g_pitch == 0)      swprintf(pitch_title, 32, L"Pitch: 0");
+        else if (g_pitch > 0)  swprintf(pitch_title, 32, L"Pitch: +%d", g_pitch);
+        else                   swprintf(pitch_title, 32, L"Pitch: %d", g_pitch);
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, pitch_title);
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    }
+
+    // ---- Devices submenu ----
+    {
+        HMENU sub = CreatePopupMenu();
+        AppendMenuW(sub, MF_GRAYED, 0, L"Input:");
+        if (g_n_dev_in > 0) {
+            for (int i = 0; i < g_n_dev_in && i < 6; i++)
+                AppendMenuW(sub, MF_STRING | (i == g_sel_in ? MF_CHECKED : 0),
+                            ID_DEV_IN_BASE + i, g_dev_in[i].friendly);
+        } else AppendMenuW(sub, MF_GRAYED, 0, L"(none)");
+        AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(sub, MF_GRAYED, 0, L"Output:");
+        if (g_n_dev_out > 0) {
+            for (int i = 0; i < g_n_dev_out && i < 6; i++)
+                AppendMenuW(sub, MF_STRING | (i == g_sel_out ? MF_CHECKED : 0),
+                            ID_DEV_OUT_BASE + i, g_dev_out[i].friendly);
+        } else AppendMenuW(sub, MF_GRAYED, 0, L"(none)");
+        AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(sub, MF_STRING, ID_DEV_INSTALL,   L"Install virtual device");
+        AppendMenuW(sub, MF_STRING, ID_DEV_UNINSTALL, L"Uninstall virtual device");
+        AppendMenuW(sub, MF_STRING, ID_DEV_RENAME,    L"Rename devices\u2026");
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, L"Devices");
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    }
+
+    // ---- Runtime submenu ----
+    {
+        HMENU sub = CreatePopupMenu();
+        for (int i = 0; i < g_n_backends; i++) {
+            if (!g_backends[i].available) continue;
+            wchar_t lbl[256];
+            swprintf(lbl, 256, L"%s \u2014 %s", g_backends[i].name, g_backends[i].desc);
+            AppendMenuW(sub, MF_STRING | (i == g_sel_be ? MF_CHECKED : 0),
+                        ID_BASE + i, lbl);
+        }
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, L"Runtime");
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    }
+
+    // ---- Start / Stop ----
     AppendMenuW(m, MF_STRING | (g_running ? MF_GRAYED : 0), ID_START, L"\u25B6 Start");
-    AppendMenuW(m, MF_STRING | (!g_running ? MF_GRAYED : 0), ID_STOP, L"\u25A0 Stop");
+    AppendMenuW(m, MF_STRING | (!g_running ? MF_GRAYED : 0), ID_STOP,  L"\u25A0 Stop");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
 
-    // Convert + Quit
-    AppendMenuW(m, MF_STRING, ID_CONVERT, L"Convert file...");
+    // ---- Convert + Quit ----
+    AppendMenuW(m, MF_STRING, ID_CONVERT, L"Convert file\u2026");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, ID_QUIT, L"Quit");
 
     SetForegroundWindow(g_hwnd);
     int cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, g_hwnd, NULL);
+    // Destroy submenus (they're owned by m, but be safe)
     DestroyMenu(m);
 
     // Handle selection
@@ -321,7 +406,34 @@ static void show_menu(void) {
         save_config();
     } else if (cmd >= ID_MODEL_BASE && cmd < ID_MODEL_BASE + MAX_MODELS) {
         g_sel_model = cmd - ID_MODEL_BASE;
+        // Model selected → transition icon: loading → loaded.
+        // (Real load happens in the model-handle refactor; for now we
+        //  reflect the state so the tray icon is meaningful.)
+        set_model_state(MODEL_LOADING);
+        SetTimer(g_hwnd, 1, 400, NULL);   // flip to LOADED shortly
         save_config();
+    } else if (cmd == ID_MODEL_RESIDENT) {
+        g_resident = !g_resident;
+        save_config();
+    } else if (cmd == ID_MODEL_UNLOAD) {
+        set_model_state(MODEL_UNLOADED);
+        save_config();
+    } else if (cmd == ID_MODEL_CONVERT) {
+        // Conversion dialog — stub for now (full dialog is a later task).
+        MessageBoxW(g_hwnd,
+            L"Model conversion dialog is in progress.\n\n" L".pth \u2192 .gguf conversion will run here with a progress tracker.",
+            L"Spartacv\u03C2 \u2014 Convert Models", MB_ICONINFORMATION);
+    } else if (cmd == ID_DEV_INSTALL) {
+        MessageBoxW(g_hwnd,
+            L"Installing the Spartacv\u03C2 virtual audio device requires the\n" L"signed WASAPI driver + installer (see docs/tray-polish-spec.md \u00a75).\n\n" L"This is the 'just works' virtual mic — coming with the installer.",
+            L"Spartacv\u03C2 \u2014 Virtual Device", MB_ICONINFORMATION);
+    } else if (cmd == ID_DEV_UNINSTALL) {
+        MessageBoxW(g_hwnd, L"No Spartacv\u03C2 virtual device is installed.",
+            L"Spartacv\u03C2", MB_ICONINFORMATION);
+    } else if (cmd == ID_DEV_RENAME) {
+        MessageBoxW(g_hwnd,
+            L"Device renaming will use the Windows device property store\n" L"(DEVPKEY_Device_FriendlyName). Available with the installer.\n\n" L"You can rename devices today in: Settings \u2192 System \u2192 Sound.",
+            L"Spartacv\u03C2 \u2014 Rename Devices", MB_ICONINFORMATION);
     } else if (cmd == ID_MODEL_BROWSE) {
         // Simple input dialog for model directory
         wchar_t buf[260];
@@ -385,6 +497,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_APP + 1:
         if (lp == WM_RBUTTONUP || lp == WM_LBUTTONUP) show_menu();
+        return 0;
+    case WM_TIMER:
+        if (wp == 1) {   // model load finished (simulated)
+            KillTimer(hwnd, 1);
+            if (g_model_state == MODEL_LOADING)
+                set_model_state(MODEL_LOADED);
+        }
         return 0;
     case WM_CLOSE:
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -463,10 +582,24 @@ int spcv_tray_run(void) {
     scan_devices();
     load_config();  // restore saved selections
 
+    HINSTANCE hinst = GetModuleHandleW(NULL);
+
+    // Load the three state icons from the resource DLL.
+    // IDs must match spartacvc.rc: 101=loaded 102=loading 103=unloaded
+    g_hicon_loaded   = LoadIconW(hinst, MAKEINTRESOURCEW(101));
+    g_hicon_loading  = LoadIconW(hinst, MAKEINTRESOURCEW(102));
+    g_hicon_unloaded = LoadIconW(hinst, MAKEINTRESOURCEW(103));
+    // Fallbacks if any resource is missing
+    if (!g_hicon_loaded)   g_hicon_loaded   = LoadIconW(NULL, IDI_APPLICATION);
+    if (!g_hicon_loading)  g_hicon_loading  = g_hicon_loaded;
+    if (!g_hicon_unloaded) g_hicon_unloaded = g_hicon_loaded;
+
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
-    wc.hInstance = GetModuleHandleW(NULL);
+    wc.hInstance = hinst;
+    wc.hIcon = g_hicon_loaded;
+    wc.hIconSm = g_hicon_loaded;
     wc.lpszClassName = L"SpartacvcTray";
     RegisterClassExW(&wc);
 
@@ -474,10 +607,8 @@ int spcv_tray_run(void) {
                              0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL);
     if (!g_hwnd) return 1;
 
-    // Try to load app icon from resource, fallback to system
-    g_hicon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
-    if (!g_hicon) g_hicon = LoadIconW(NULL, IDI_APPLICATION);
-
+    // Initial model state: unloaded (icon reflects this)
+    g_model_state = MODEL_UNLOADED;
     add_tray_icon();
 
     MSG msg;
@@ -486,7 +617,9 @@ int spcv_tray_run(void) {
         DispatchMessageW(&msg);
     }
 
-    if (g_hicon) DestroyIcon(g_hicon);
+    if (g_hicon_loaded)   DestroyIcon(g_hicon_loaded);
+    if (g_hicon_loading)  DestroyIcon(g_hicon_loading);
+    if (g_hicon_unloaded) DestroyIcon(g_hicon_unloaded);
     wasapi_co_uninit();
     return 0;
 }

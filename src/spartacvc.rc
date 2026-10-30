@@ -1,2 +1,12 @@
 #include <windows.h>
-IDR_MAINICON ICON DISCARDABLE "spartacvc.ico"
+
+// Icon resource IDs (must match tray.c LoadIconW calls)
+#define ICON_LOADED   101
+#define ICON_LOADING  102
+#define ICON_UNLOADED 103
+
+// ID 1 = file/explorer icon (loaded state, gold S)
+1             ICON DISCARDABLE "spartacvc.ico"
+ICON_LOADED   ICON DISCARDABLE "spartacvc_loaded.ico"
+ICON_LOADING  ICON DISCARDABLE "spartacvc_loading.ico"
+ICON_UNLOADED ICON DISCARDABLE "spartacvc_unloaded.ico"
