@@ -234,3 +234,12 @@ spartacvc_tray.exe
 | Tesla PG500-216 (V100 lite, sm_70, TCC, 32GB) | CUDA | ✅ 2.4s/4.1s |
 | Radeon Vega Frontier Edition | Vulkan | ✅ 13.8s/4.1s |
 | CPU (48 cores) | ggml-cpu | ✅ works |
+
+### Virtual Audio Driver (Spectre libs) — status
+- WDK 10.0.22000.1 installed ✅. Driver source (KMDF) cloned to `third_party/virtual-audio-driver/`.
+- MSB8040: Spectre-mitigated CRT libs missing. `SpectreMitigation=Off` is invalid in VS 17.14 — must install via VS component.
+- Attempt #1 (exit 1603): used package IDs; `--add` needs **component IDs**.
+- Attempt #2 (exit 8006): pre-check `VSProcessesRunning` + `OutOfSupportSelectablesCheck` (14.30 component out-of-support).
+- Driver build uses **MSVC 14.44** (per .lastbuildstate) → only `Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64.Spectre` needed.
+- `install_spectre.bat` updated (14.44 only, kills devenv/VBCSCompiler first). **Pending: user re-run as admin**, then `C:\temp\build_driver.bat`.
+- **Spectre attempt #2b (window blinked, nothing ran):** edit tool wrote the .bat with LF line endings; cmd.exe silently exits on LF-only batch files. Fixed with `sed -i 's/\r$//; s/$/\r/'`. **RULE: batch files must be CRLF — verify after any tool-write.**

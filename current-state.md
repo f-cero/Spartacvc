@@ -30,15 +30,15 @@ ASCII "spartacvc"/"Spartacvc" in code/paths/filenames.
 | `.pth → .gguf` conversion | ✅ Working (in-app + standalone, parallelized 0.24s) |
 | Tray app core (menu, devices, models, start/stop) | ✅ Working (batch RVC via CLI round-trip, ~2–3s latency) |
 | Tray polish: state icons, pitch submenu, device/runtime submenus, resident toggle, model state | ✅ In code (commit 50fe61b) — **not yet user-verified** |
-| Virtual audio driver `.sys` | 🔴 **BLOCKED** — compiles, does not link to .sys (see §4) |
-| Driver installer / device registration | ⬜ Not started (needs .sys first) |
+| Virtual audio driver `.sys` | ✅ **LOADING** (2026-11-10, KMDF 1.15 bind; branded Spartacvc) |
+| Driver install pipeline (devcon batch) | ✅ Working manually (`C:\temp\install_driver.bat`); tray menu wiring ⬜ |
 | Registry config (HKCU) + portable mode | ⬜ Not done (.cfg persistence exists) |
 | Model handle refactor (load/infer/free, load-on-launch, cancel, unload) | ⬜ Not done — ggml pipeline reloads from disk every call |
 | Conversion dialog (Win32 window w/ progress) | ⬜ Not done (menu item works via CLI) |
 | Runtime DLL split (ggml-cuda.dll / ggml-vulkan.dll beside exe) | ⬜ Not done — exes are ~213MB static |
 | Installer (NSIS/MSI with options) | ⬜ Not started |
 | True real-time RVC in tray (pipeline linked directly, <100ms budget) | ⬜ Not done — currently shells out to spartacvc.exe per chunk |
-| Git push | 🔴 **34 commits ahead of origin/main** — unpushed! |
+| Git push | 🔴 **36+ commits ahead of origin/main** — unpushed! |
 
 ---
 
@@ -83,49 +83,44 @@ ASCII "spartacvc"/"Spartacvc" in code/paths/filenames.
 
 ---
 
-## 4. ACTIVE BLOCKER: driver `.sys` build
+## 4. Driver .sys — SOLVED (2026-11-10)
 
-### ✅ RESOLVED 2026-11-08 (this session — Genspark Claw)
-`VirtualAudioDriver.sys` (94KB, x64 native, entry FxDriverEntry) now builds via
-`C:\temp\build_driver2.bat` (retry loop). Root causes fixed in
-`Directory.Build.props` + NEW `Directory.Build.targets` (driver repo, commit d8029e3):
+Build + install pipeline fully working. Driver loads ("Driver is running"),
+endpoints live: "Spartacvc Mic" (capture) / "Spartacvc (RVC output)" (render).
 
-1. `Directory.Build.targets` (evaluated after all props): for
-   `ConfigurationType==Driver` set OutputType=sys, TargetExt=.sys,
-   GenerateManifest=false, LinkCompiled=true; for StaticLibrary: clear @(Link)
-   items via `_SpcvClearStaticLibLink` BeforeTargets=Link (kernel props applies
-   driver link metadata to ALL projects → spurious failing Link in libs).
-2. `Directory.Build.props` rewritten cleanly (was 10 duplicated TargetExt
-   blocks from old session's loop): sets WDKContentRoot, km/shared/wdf include
-   paths, `_AMD64_`, `_NO_CRT_STDIO_INLINE` (kernel CRT guard — without it
-   km/ntstrsafe.h's `#include <stdio.h>` drags in user-mode CRT inlines →
-   unresolvable `__imp___stdio_common_vswprintf`), DDK_LIB_PATH + WdfLibPath +
-   LibraryPath (km\x64 + Lib\wdf\kmdf\x64\1.27).
-3. `_SpcvFixDriverLink` target (BeforeTargets=Link, Driver only): replaces the
-   default user-mode dependency list with kernel set:
-   ntoskrnl hal portcls stdunk libcntpr ntstrsafe bufferoverflowfastfailk +
-   wdfdriverentry + wdfldr + Utilities.lib + Filters.lib + Main objs;
-   IgnoreAllDefaultLibraries; EntryPointSymbol=FxDriverEntry; SubSystem=Native.
+### The complete saga (so nobody re-treads this)
+1. Link never ran → fixed via `Directory.Build.targets` (OutputType=sys,
+   TargetExt=.sys, GenerateManifest=false, LinkCompiled for Driver config;
+   clear @(Link) for StaticLibrary; kernel lib deps + EntryPointSymbol=FxDriverEntry).
+2. INF fixes: strip UTF-8 BOM (breaks pnputil/devcon!), drop the
+   NTamd64.10.0...22000 decoration (Win11-only — the OFFICIAL MTT release has
+   this bug too and does NOT install on Win10!), drop DRM/PETrust
+   SignatureAttributes.
+3. Signing: self-signed "Spartacvc Test" cert (thumbprint D56B20B6...) in
+   Root + TrustedPublisher; testsigning ON; Secure Boot disabled in firmware
+   (blocked bcdedit before).
+4. **Bind failure (problem 37) root cause: KMDF bind protocol changed above
+   1.15.** Every stub >=1.25 (any kit generation, incl. era-correct EWDK
+   19041 ones) fails WdfVersionBind on the 19041 runtime with a MISLEADING
+   event ("Bind Minor version is greater" even when driver < runtime).
+   DriverEntry never ran (registry-marker proof). A/B: minimal KMDF driver
+   failed identically; VB Voicemeeter VAIO binds 1.15 and works (user hunch).
+   FIX: headers Include\wdf\kmdf\1.15 + stubs Lib\wdf\kmdf\x64\1.15
+   (EWDK-19041 copies at C:\temp\ewdk_wdf15 + C:\temp\ewdk_inc15),
+   stampinf -k 1.15.
 
-NOTE: `echo DONE %ERRORLEVEL%` in the batch shows findstr's exit code, not
-msbuild's — "DONE 1" with "Build succeeded" in bld.log is SUCCESS.
+### Build/install pipeline (reproduce end to end)
+- Build: `cmd /c C:\temp\build_driver2.bat` (retry loop; "DONE 1" is
+  findstr's exit code — success = "Build succeeded" in C:\temp\bld.log)
+- Stage: copy .sys -> virtualaudiodriver.sys + .inx -> stampinf -a amd64
+  -d * -v 1.0.0.0 -k 1.15 -> inf2cat /os:10_x64 -> signtool sign (test cert)
+- Install: `C:\temp\install_driver.bat` elevated (devcon, ROOT\VirtualAudioDriver)
+- 22000 stub backup: C:\temp\wdf131_22000_backup; EWDK ISO: C:\temp\ewdk19041.iso
 
-### Next steps for the driver (in order)
-1. ~~Get .sys built~~ ✅ DONE
-2. Verify with `dumpbin /headers` ✅ (x64, Native, FxDriverEntry)
-3. Test-signing: enable on this machine (`bcdedit /set testsigning on`), install
-   the driver (devcon/devmgmt or package project output) and confirm the two
-   virtual endpoints (Spartacvc Mic / Spartacvc Output) appear in Sound settings.
-4. Then: tray "Install/Uninstall virtual device" menu items + installer.
-
-### Key paths
-- MSBuild: `C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\amd64\msbuild.exe` (32-bit `Bin\MSBuild.exe` also works)
-- WDK: `C:\Program Files (x86)\Windows Kits\10` (version 10.0.22000.0; portcls.lib in `Lib\10.0.22000.0\km\x64`)
-- Driver sln: `third_party/virtual-audio-driver/VirtualAudioDriver.sln` — projects: Package, Filters, Utilities, Inc, Main (Main = the driver)
-- Build logs land in `C:\temp\bld.log`; preprocess trace at `C:\temp\pp_main.txt`
-
----
-
+### Next driver steps
+- Wire tray Install/Uninstall virtual device menu (reuse staging pipeline)
+- For release: MS attestation signing (EV cert + partner portal) so end users
+  dont need testsigning; INX branding done (Spartacvc).
 ## 5. Environment quirks & rules (learned the hard way)
 
 1. **X: drive is flaky** — intermittent "No such device" / MSB4025 on reads
