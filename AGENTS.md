@@ -110,6 +110,19 @@ for ownership semantics and exact param order. Don't guess.**
 - `CreateTensorWithDataAsOrtValue`: byte_size must match dims * elem_size exactly
 - ONNX types: 1=FLOAT(4B), 2=UINT8(1B), 6=INT32(4B), 7=INT64(8B), 10=FLOAT16(2B)
 
+## NAMING / BRANDING (dual-form rule)
+
+Two forms of the name, used with intent:
+
+- **`Spartacvς`** (with Greek final sigma, U+03C2) — the stylized form.
+  README title, logo, app UI text, installer, marketing. The face.
+- **`Spartacvc`** (plain ASCII) — code, paths, CLI flags, service names,
+  registry keys, commit messages, file names. Searchable and typeable.
+
+Never "fix" one into the other. Display form renders pretty; ASCII form is
+what you type and grep. When adding UI strings or INF friendly names, use the
+stylized form; when adding identifiers, use ASCII.
+
 ## STYLE
 
 - C99, no C++ constructs
