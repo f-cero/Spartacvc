@@ -121,6 +121,20 @@ endpoints live: "Spartacvc Mic" (capture) / "Spartacvc (RVC output)" (render).
 - Wire tray Install/Uninstall virtual device menu (reuse staging pipeline)
 - For release: MS attestation signing (EV cert + partner portal) so end users
   dont need testsigning; INX branding done (Spartacvc).
+## 4b. FAISS retrieval — wired (2026-11-13)
+
+- CLI: `--index <path>` + `--index-rate <r>` — verified E2E (output differs
+  with/without; af_heart -> nahida @ cpu, 8.4s). Blend feeds all paths
+  (ggml/ONNX/CPU) since it happens on emb_model before the decoder.
+- Tray + rt worker: auto-discover `<model>*.index.bin` next to the voice
+  model (src/index_discover.h) and pass `--index`. Dim mismatch is safe
+  (main.c skips with warning).
+- nahida index: models/voices/nahida-jp.index.bin (SPCVIX01 format, d=768).
+  Re-extract from .pth via tools/extract_index.py if lost.
+- Distribution note: spartacvc.exe needs beside it: onnxruntime.dll,
+  DirectML.dll, onnxruntime_providers_shared.dll (third_party/onnxruntime),
+  cublas64_12/cublasLt64_12/cudart64_12 (kokoro-tts folder has copies), and
+  system VC redist (VCOMP140/MSVCP140/VCRUNTIME140). Fold into installer.
 ## 5. Environment quirks & rules (learned the hard way)
 
 1. **X: drive is flaky** — intermittent "No such device" / MSB4025 on reads
