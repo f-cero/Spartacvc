@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include "wasapi.h"
 #include "pipeline_rt.h"
+#include "index_discover.h"
 
 static volatile int g_stop = 0;
 static volatile int g_running = 0;
@@ -172,9 +173,23 @@ static DWORD WINAPI rt_worker(LPVOID arg) {
                 wchar_t cli[300];
                 swprintf(cli, 300, L"%sspartacvc.exe", g_exe_dir);
                 wchar_t cmd[2048];
+                wchar_t idx_path[520] = L"";
+                wchar_t idx_arg[600] = L"";
+                {
+                    /* auto-discover retrieval index next to the model */
+                    wchar_t model_dir[300], model_file[260];
+                    wcsncpy(model_dir, g_model, 299); model_dir[299] = 0;
+                    wchar_t* sl = wcsrchr(model_dir, L'\\');
+                    if (sl) {
+                        wcsncpy(model_file, sl + 1, 259); model_file[259] = 0;
+                        *sl = 0;
+                        if (spcv_index_autodiscover(model_dir, model_file, idx_path, 520))
+                            swprintf(idx_arg, 600, L" --index \"%s\"", idx_path);
+                    }
+                }
                 swprintf(cmd, 2048,
-                    L"\"%s\" \"%s\" --voice \"%s\" --hubert \"%s\" --rmvpe \"%s\" --backend %s --pitch %d --out \"%s\"",
-                    cli, in_path, g_model, g_hubert, g_rmvpe, be_str, g_pitch, out_path);
+                    L"\"%s\" \"%s\" --voice \"%s\" --hubert \"%s\" --rmvpe \"%s\" --backend %s --pitch %d%s --out \"%s\"",
+                    cli, in_path, g_model, g_hubert, g_rmvpe, be_str, g_pitch, idx_arg, out_path);
 
                 STARTUPINFOW si = { sizeof(si) };
                 PROCESS_INFORMATION pi = {0};

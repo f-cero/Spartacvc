@@ -22,6 +22,7 @@
 #include "tray.h"
 #include "wasapi.h"
 #include "pipeline_rt.h"
+#include "index_discover.h"
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
 #include "ggml-vulkan.h"
@@ -210,9 +211,13 @@ static void do_convert_file(void) {
     swprintf(rmvpe, 300, L"%smodels\base\rmvpe.onnx", exe_dir);
 
     wchar_t cmd[2048];
+    wchar_t idx_path[520];
+    wchar_t idx_arg[600] = L"";
+    if (spcv_index_autodiscover(g_model_dir, g_models[g_sel_model], idx_path, 520))
+        swprintf(idx_arg, 600, L" --index \"%s\"", idx_path);
     swprintf(cmd, 2048,
-        L"\"%s\" \"%s\" --voice \"%s\" --hubert \"%s\" --rmvpe \"%s\" --backend %s --pitch %d --out \"%s\"",
-        cli_path, in_file, model_path, hubert, rmvpe, be, g_pitch, out_file);
+        L"\"%s\" \"%s\" --voice \"%s\" --hubert \"%s\" --rmvpe \"%s\" --backend %s --pitch %d%s --out \"%s\"",
+        cli_path, in_file, model_path, hubert, rmvpe, be, g_pitch, idx_arg, out_file);
 
     // Show progress
     MessageBoxW(g_hwnd, L"Converting...\nThis may take a minute.", L"Spartacv\u03C2", MB_OK);
